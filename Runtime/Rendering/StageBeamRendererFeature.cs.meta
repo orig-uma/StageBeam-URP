@@ -1,0 +1,12 @@
+fileFormatVersion: 2
+guid: 28933027612d2154e830cac8737355af
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - _hazeNoise: {fileID: 11700000, guid: 2b162eec6aaaa0641b1dc46ff65f0a45, type: 2}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
