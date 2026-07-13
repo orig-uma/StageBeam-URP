@@ -142,6 +142,11 @@ namespace Origuma.StageBeam
                  "instead of sphere/box approximations — geometry-true silhouettes at voxel " +
                  "resolution, cost still independent of the light count.")]
         [SerializeField] private bool _volMeshVoxelize = true;
+        [Tooltip("Mesh-voxelization orthographic passes (X/Y/Z). 3 = fully conservative. 2 drops " +
+                 "the top-down pass — the biggest CPU cut to the occlusion build (recorded draw " +
+                 "count scales with this) and usually enough for upright performers. Lower if the " +
+                 "build's CPU cost matters more than catching perfectly horizontal surfaces.")]
+        [Range(1, 3)] [SerializeField] private int _volVoxelizeAxes = 3;
         [Tooltip("0 = no shadow, 1 = fully black in occluded regions.")]
         [Range(0f, 1f)] [SerializeField] private float _volStrength = 1f;
         [Tooltip("Occluder opacity per metre along the shadow ray (Beer-Lambert extinction). " +
@@ -330,6 +335,15 @@ namespace Origuma.StageBeam
                 return null;
             }
 
+#if UNITY_EDITOR
+            // The occupancy build runs an immediate Graphics.ExecuteCommandBuffer OUTSIDE the
+            // RenderGraph, which stops the Frame Debugger from freezing a frame (it re-submits GPU
+            // work on every repaint). While the editor is PAUSED — the Frame Debugger's normal use
+            // — skip the rebuild entirely: returning null keeps the last-bound volume + globals, so
+            // the shadow holds its last state and the debugger can capture a stable frame.
+            if (UnityEditor.EditorApplication.isPaused) return null;
+#endif
+
             // Rebuild at most once per Volume Update Interval frames in play mode (every camera
             // in edit mode — frameCount stalls there). On skipped frames we return null WITHOUT
             // releasing/neutralising, so last build's bound volume + globals stay live: the
@@ -360,6 +374,7 @@ namespace Origuma.StageBeam
             var b = _occlusionBuilder;
             b.OccluderMask      = _occluderMask;
             b.MeshVoxelize      = _volMeshVoxelize;
+            b.VoxelizeAxisCount = _volVoxelizeAxes;
             b.Strength          = _volStrength;
             b.ShadowDensity     = _volDensity;
             b.ShadowSteps       = _volSteps;
@@ -471,6 +486,10 @@ namespace Origuma.StageBeam
                 _pass.OrthoPixelsPerUnit = cam.orthographic
                     ? cam.pixelHeight * 0.5f / Mathf.Max(cam.orthographicSize, 1e-3f) : 0f;
             }
+            // Build the GPU-instance batches now (CPU, cull data is set) so the buffer upload
+            // happens before the graph executes — not inside a render func (avoids a stall) — and
+            // both the beam and projection instanced draws consume the same batches.
+            _pass.BuildInstanceBatches();
             renderer.EnqueuePass(_pass);
         }
 
@@ -670,6 +689,13 @@ namespace Origuma.StageBeam
                     ctx.cmd.SetGlobalFloat(IdProjShadowHardness, d.ShadowHardness);
                     ctx.cmd.SetGlobalFloat(IdProjReceiverMask, d.MaskOn ? 1f : 0f);
                     if (d.MaskOn) ctx.cmd.SetGlobalTexture(IdProjReceiverDepth, d.ReceiverDepth);
+
+                    if (StageBeamQueue.Instancing && AllowInstancing)
+                    {
+                        DrawProjectionInstanced(ctx, d.Mat);
+                        return;
+                    }
+
                     var items = StageBeamQueue.Items;
                     for (var i = 0; i < items.Count; i++)
                     {
@@ -712,8 +738,17 @@ namespace Origuma.StageBeam
                 }
             }
 
-            private void DrawBeamsInstanced(RasterGraphContext ctx)
+            private bool _batchesReady;
+            private int _projInstancedPass = -1;
+
+            // Builds the per-gobo instance batches from the visible beams ONCE per frame, on the CPU
+            // in AddRenderPasses (before the graph executes) — so the GraphicsBuffer upload isn't a
+            // stall inside a render func, and BOTH the beam pass and the projection pass draw from
+            // the same batches (the projection reuses the identical per-beam GpuBeam data).
+            internal void BuildInstanceBatches()
             {
+                _batchesReady = false;
+                if (!(StageBeamQueue.Instancing && AllowInstancing)) return;
                 var items = StageBeamQueue.Items;
                 _batcher ??= new StageBeamInstanceBatcher();
                 _batcher.Begin();
@@ -724,11 +759,14 @@ namespace Origuma.StageBeam
                     _batcher.Add(in it.Raw, it.GoboA, it.GoboB);
                 }
                 _batcher.BuildBatches();
-                if (_batcher.Count == 0 || _batcher.Buffer == null) return;
+                _batchesReady = _batcher.Count > 0 && _batcher.Buffer != null;
+            }
 
-                if (_instancedPass < 0)
-                    _instancedPass = Mathf.Max(0, StageBeamQueue.Material.FindPass("StageBeamInstanced"));
-
+            // Draws the prebuilt batches with the given material + pass (cone or projection). The
+            // per-batch MPB carries the shared buffer, the batch's base offset and its gobo arrays.
+            private void DrawInstancedBatches(RasterGraphContext ctx, Material material, int pass)
+            {
+                if (!_batchesReady) return;
                 var batches = _batcher.Batches;
                 for (var b = 0; b < batches.Count; b++)
                 {
@@ -740,9 +778,25 @@ namespace Origuma.StageBeam
                     mpb.SetInt(IdStageBeamBase, batch.Start);
                     if (batch.GoboA != null) mpb.SetTexture(IdGoboArray, batch.GoboA);
                     if (batch.GoboB != null) mpb.SetTexture(IdGoboArray2, batch.GoboB);
-                    ctx.cmd.DrawMeshInstancedProcedural(StageBeamQueue.Mesh, 0,
-                        StageBeamQueue.Material, _instancedPass, batch.Count, mpb);
+                    ctx.cmd.DrawMeshInstancedProcedural(StageBeamQueue.Mesh, 0, material, pass, batch.Count, mpb);
                 }
+            }
+
+            private void DrawBeamsInstanced(RasterGraphContext ctx)
+            {
+                if (_instancedPass < 0)
+                    _instancedPass = Mathf.Max(0, StageBeamQueue.Material.FindPass("StageBeamInstanced"));
+                DrawInstancedBatches(ctx, StageBeamQueue.Material, _instancedPass);
+            }
+
+            // GPU-instanced projection (decal) draw — same batches as the beam pass, drawn with the
+            // projection material's instanced pass. Collapses the per-beam projection DrawMesh loop
+            // (its own pass in the Frame Debugger, ~one draw per beam) to one draw per gobo batch.
+            private void DrawProjectionInstanced(RasterGraphContext ctx, Material mat)
+            {
+                if (_projInstancedPass < 0)
+                    _projInstancedPass = Mathf.Max(0, mat.FindPass("StageBeamProjectionInstanced"));
+                DrawInstancedBatches(ctx, mat, _projInstancedPass);
             }
 
             private void RecordFullRes(RenderGraph renderGraph, UniversalResourceData resources,

@@ -284,12 +284,18 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
         }
     #endif
         float boost = rootBoost - 1.0;
-        sum      += base * (1.0 + boost * (1.0 - p.rootWhite));
-        whiteSum += base * boost * p.rootWhite;
-        sumRaw   += baseRaw * (1.0 + boost * (1.0 - p.rootWhite));
+        float bC = 1.0 + boost * (1.0 - p.rootWhite);   // colour weight (was recomputed ×3)
+        float bW = boost * p.rootWhite;                  // white weight (was recomputed ×2)
+        sum        += base * bC;
+        whiteSum   += base * bW;
         float baseNM = baseRaw / hazeF;
-        sumNH      += baseNM * (1.0 + boost * (1.0 - p.rootWhite));
-        whiteSumNH += baseNM * boost * p.rootWhite;
+        sumNH      += baseNM * bC;
+        whiteSumNH += baseNM * bW;
+    #if defined(_STAGEBEAM_SHADOWS_VOLUME)
+        // sumRaw feeds ONLY the shadow-debug view — accumulate it only when that's on, not every
+        // sample of every production frame.
+        if (_BeamShadowDebug > 0.5) sumRaw += baseRaw * bC;
+    #endif
     }
 
     float scale = (1.0 / steps) * chord * p.density * p.intensity * _StageBeamMaster;

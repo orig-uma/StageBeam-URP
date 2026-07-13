@@ -26,7 +26,11 @@ namespace Origuma.StageBeam
     {
         // --- occluder discovery ---------------------------------------------------------------
         public LayerMask OccluderMask = ~0;
-        public float RescanInterval = 0.25f;
+        // Occluder DISCOVERY interval (FindObjectsByType allocates a full scene renderer array, so
+        // this is deliberately infrequent). Enabling an already-discovered occluder is instant (the
+        // gather gates on activeInHierarchy), so this only bounds how fast a NEWLY SPAWNED occluder
+        // starts casting — 1s is plenty for a stage scene whose cast rarely changes at runtime.
+        public float RescanInterval = 1.0f;
 
         /// <summary>Voxelize the occluders' REAL meshes (3-axis rasterization into the volume)
         /// instead of approximating them with spheres/boxes. Silhouettes become the actual
@@ -53,6 +57,12 @@ namespace Origuma.StageBeam
         // limbs read as limbs instead of aliased blocks.
         public Vector3Int Resolution = new Vector3Int(96, 72, 96);
         public float EdgeSoftness = 0.5f;
+        // Mesh-voxelization orthographic passes. 3 (X/Y/Z) is fully conservative; 2 drops the
+        // top-down pass (cheapest CPU cut — recorded DrawRenderer count scales with this) and is
+        // usually enough for upright performers since the two horizontal passes + the GrowMax fill
+        // already close the body. Lower this if the occlusion build's CPU cost matters more than
+        // catching perfectly horizontal surfaces (out-held arms' top faces).
+        public int VoxelizeAxisCount = 3;
         /// <summary>Temporal smoothing of the occupancy (0 = off/instant, 1 = heavy). Absorbs the
         /// frame-to-frame voxel chatter a moving occluder causes; higher = smoother but the
         /// shadow lags moving occluders more.</summary>
@@ -98,6 +108,12 @@ namespace Origuma.StageBeam
         // dedupes so a hinted character casts exactly one capsule/box.
         private readonly List<StageBeamOccluderHint> _occluderHints = new List<StageBeamOccluderHint>(128);
         private readonly HashSet<StageBeamOccluderHint> _emittedHints = new HashSet<StageBeamOccluderHint>();
+        // Reused for Renderer.GetSharedMaterials so the rescan submesh-count read allocates nothing
+        // (the `sharedMaterials` PROPERTY returns a fresh array on every access).
+        private readonly List<Material> _tempMaterials = new List<Material>(8);
+        // Per-occluder "rasterize this in the voxelize passes" flag, computed ONCE per build
+        // (active + not-too-big) so the per-axis draw loops don't recompute r.bounds ×3.
+        private bool[] _voxelizeFlags;
         private Vector4[] _spheres;          // xyz = centre, w = radius
         private Vector4[] _boxes;            // 3 per box: [centre, minHalfExt], [halfExt, 0], [rot quat]
         private int _sphereCount, _boxCount;
@@ -269,7 +285,10 @@ namespace Origuma.StageBeam
             if (_occluderSubMeshes == null || _occluderSubMeshes.Length < _occluders.Count)
                 _occluderSubMeshes = new int[_occluders.Count];
             for (var i = 0; i < _occluders.Count; i++)
-                _occluderSubMeshes[i] = Mathf.Max(1, _occluders[i].sharedMaterials.Length);
+            {
+                _occluders[i].GetSharedMaterials(_tempMaterials);   // non-allocating
+                _occluderSubMeshes[i] = Mathf.Max(1, _tempMaterials.Count);
+            }
         }
 
         private void GatherOccluders()
@@ -685,10 +704,23 @@ namespace Origuma.StageBeam
                 1f / Mathf.Max(_ws.z, 1e-3f)));
             cmd.SetGlobalVector(IdVoxRes, new Vector3(res.x, res.y, res.z));
 
+            // Decide once which occluders rasterize (active + not too big), so the per-axis loops
+            // below just read a flag instead of re-touching r.bounds three times.
+            if (_voxelizeFlags == null || _voxelizeFlags.Length < _occluders.Count)
+                _voxelizeFlags = new bool[Mathf.Max(_occluders.Count, 8)];
+            for (var i = 0; i < _occluders.Count; i++)
+            {
+                var r = _occluders[i];
+                _voxelizeFlags[i] = r != null && r.enabled && r.gameObject.activeInHierarchy &&
+                    (MaxOccluderSize <= 0f || r.bounds.extents.magnitude * 2f <= MaxOccluderSize);
+            }
+
             cmd.SetRandomWriteTarget(1, _volume);
+            // 3 axes = fully conservative; 2 drops the top-down pass; 1 keeps only the side pass.
+            int axes = Mathf.Clamp(VoxelizeAxisCount, 1, 3);
             DrawAxis(cmd, Vector3.right,   Vector3.up,      new Vector2(_ws.z, _ws.y), _ws.x);
-            DrawAxis(cmd, Vector3.up,      Vector3.forward, new Vector2(_ws.x, _ws.z), _ws.y);
-            DrawAxis(cmd, Vector3.forward, Vector3.up,      new Vector2(_ws.x, _ws.y), _ws.z);
+            if (axes >= 3) DrawAxis(cmd, Vector3.up, Vector3.forward, new Vector2(_ws.x, _ws.z), _ws.y);
+            if (axes >= 2) DrawAxis(cmd, Vector3.forward, Vector3.up, new Vector2(_ws.x, _ws.y), _ws.z);
             cmd.ClearRandomWriteTargets();
             cmd.ReleaseTemporaryRT(IdVoxTargetRT);
         }
@@ -710,13 +742,9 @@ namespace Origuma.StageBeam
 
             for (var i = 0; i < _occluders.Count; i++)
             {
+                // Precomputed once per build in RecordVoxelizeMeshes (active + not too big).
+                if (_voxelizeFlags == null || i >= _voxelizeFlags.Length || !_voxelizeFlags[i]) continue;
                 var r = _occluders[i];
-                // Gate on activeInHierarchy: inactive occluders stay cached (see Rescan) but
-                // contribute nothing to the volume until their GameObject is enabled.
-                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
-                // Same "too big" filter as the shape path (floors/walls don't shadow beams).
-                if (MaxOccluderSize > 0f && r.bounds.extents.magnitude * 2f > MaxOccluderSize)
-                    continue;
                 int subs = _occluderSubMeshes != null && i < _occluderSubMeshes.Length
                     ? _occluderSubMeshes[i] : 1;
                 for (int sm = 0; sm < subs; sm++)

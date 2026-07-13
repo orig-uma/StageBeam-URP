@@ -212,6 +212,142 @@ Shader "Origuma/StageBeamProjection"
             }
             ENDHLSL
         }
+
+        // GPU-instanced variant: one DrawMeshInstancedProcedural per gobo batch, reading the SAME
+        // per-beam StructuredBuffer<GpuBeam> the cone pass uses. Collapses the projection pass from
+        // one DrawMesh per beam (the dominant CPU draw-call cost with gobos on) to one per batch.
+        // The decal is fill-light, not a raymarch, so it just reads the GpuBeam per fragment.
+        Pass
+        {
+            Name "StageBeamProjectionInstanced"
+            Tags { "LightMode" = "SRPDefaultUnlit" }
+            Blend One One
+            ZWrite Off
+            ZTest Always
+            Cull Front
+            HLSLPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
+            #pragma multi_compile _ _STAGEBEAM_SHADOWS_SCREEN _STAGEBEAM_SHADOWS_VOLUME _STAGEBEAM_SHADOWS_LIGHT
+            #pragma multi_compile_fragment _ _ADDITIONAL_LIGHT_SHADOWS
+            #pragma multi_compile_fragment _ _SHADOWS_SOFT
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
+            #include "StageBeamShadow.hlsl"
+            #include "StageBeamInstanced.hlsl"
+
+            float _ProjSurfaceBoost;
+            float _ProjNormalCull;
+            float _ProjShadowHardness;
+            float _ProjReceiverMaskOn;
+            TEXTURE2D_X(_StageBeamReceiverDepth);
+            SAMPLER(sampler_StageBeamReceiverDepth);
+            TEXTURE2D_ARRAY(_GoboArray);  SAMPLER(sampler_GoboArray);
+            TEXTURE2D_ARRAY(_GoboArray2); SAMPLER(sampler_GoboArray2);
+
+            struct Attributes { float3 positionOS : POSITION; uint instanceID : SV_InstanceID; };
+            struct Varyings   { float4 positionHCS : SV_POSITION; nointerpolation uint instanceID : TEXCOORD0; };
+
+            Varyings vert (Attributes v)
+            {
+                Varyings o;
+                GpuBeam b = StageBeamAt(v.instanceID);
+                float t = v.positionOS.y;
+                float r = lerp(b.p0.x, b.p0.y, saturate(t)) * 1.2;   // startRadius, endRadius
+                float3 posOS = float3(v.positionOS.x * r, -t * b.p0.z, v.positionOS.z * r); // range = p0.z
+                o.positionHCS = TransformWorldToHClip(StageBeamObjectToWorld(b, posOS));
+                o.instanceID = v.instanceID;
+                return o;
+            }
+
+            half4 frag (Varyings i) : SV_Target
+            {
+                GpuBeam b = StageBeamAt(i.instanceID);
+                float startRadius = b.p0.x, range = b.p0.z, edgeSoftness = b.p0.w;
+                float fieldHalf = b.p1.x, axialFalloff = b.p2.z, intensityP = b.p3.w;
+
+                float2 uv = GetNormalizedScreenSpaceUV(i.positionHCS);
+                float deviceDepth = SampleSceneDepth(uv);
+
+                if (_ProjReceiverMaskOn > 0.5)
+                {
+                    float recvDevice = SAMPLE_TEXTURE2D_X(_StageBeamReceiverDepth,
+                        sampler_StageBeamReceiverDepth, uv).r;
+                    float sceneEye = LinearEyeDepth(deviceDepth, _ZBufferParams);
+                    float recvEye  = LinearEyeDepth(recvDevice, _ZBufferParams);
+                    if (abs(sceneEye - recvEye) > 0.02 * sceneEye + 0.02) return 0;
+                }
+
+                float3 surfWS = ComputeWorldSpacePosition(uv, deviceDepth, UNITY_MATRIX_I_VP);
+                float3 pOS = StageBeamWorldToObject(b, surfWS);
+                float axis = -pOS.y;
+                if (axis <= 0.0 || axis > range) return 0;
+                float tanField = max(tan(fieldHalf), 1e-3);
+                float coneR = axis * tanField + startRadius;
+                float rad = length(pOS.xz);
+                if (rad > coneR) return 0;
+
+                float nearFade = _BeamShadowLightBias > 0.0 ? smoothstep(0.0, _BeamShadowLightBias, axis) : 1.0;
+                if (nearFade <= 0.0) return 0;
+
+                float sideSoftness = max(edgeSoftness, 0.01);
+                float side = saturate((coneR - rad) / (coneR * sideSoftness));
+                float axNorm = axis / range;
+                float axialAtt = saturate(1.0 - axNorm * axNorm * axialFalloff);
+
+                float2 px = float2(1.0 / _ScreenParams.x, 0.0);
+                float2 py = float2(0.0, 1.0 / _ScreenParams.y);
+                float3 posR = ComputeWorldSpacePosition(uv + px, SampleSceneDepth(uv + px), UNITY_MATRIX_I_VP);
+                float3 posL = ComputeWorldSpacePosition(uv - px, SampleSceneDepth(uv - px), UNITY_MATRIX_I_VP);
+                float3 posU = ComputeWorldSpacePosition(uv + py, SampleSceneDepth(uv + py), UNITY_MATRIX_I_VP);
+                float3 posD = ComputeWorldSpacePosition(uv - py, SampleSceneDepth(uv - py), UNITY_MATRIX_I_VP);
+                float3 dX = length(posR - surfWS) < length(surfWS - posL) ? posR - surfWS : surfWS - posL;
+                float3 dY = length(posU - surfWS) < length(surfWS - posD) ? posU - surfWS : surfWS - posD;
+                float3 nWS = normalize(cross(dY, dX));
+                if (dot(nWS, GetCameraPositionWS() - surfWS) < 0.0) nWS = -nWS;
+                float3 beamDownWS = normalize(StageBeamObjectToWorldDir(b, float3(0, -1, 0)));
+                float facing = dot(nWS, -beamDownWS);
+                float normalFade = smoothstep(0.0, max(_ProjNormalCull, 1e-3), facing);
+                if (normalFade <= 0.0) return 0;
+
+                float gobo = 1.0;
+                bool useGobo  = b.g0.x >= 0.0;   // goboSlice
+                bool useGobo2 = b.g1.x >= 0.0;   // goboSlice2
+                if (useGobo || useGobo2)
+                {
+                    float2 g = pOS.xz / max(coneR, 1e-5);
+                    if (useGobo)
+                    {
+                        float cs = cos(b.g0.y), sn = sin(b.g0.y);   // goboRot
+                        float2 guv = float2(g.x * cs - g.y * sn, g.x * sn + g.y * cs) * 0.5 + 0.5;
+                        if (abs(b.g0.z) + abs(b.g0.w) > 1e-5) guv = frac(guv + b.g0.zw); // goboOffset
+                        half4 g1 = SAMPLE_TEXTURE2D_ARRAY(_GoboArray, sampler_GoboArray, guv, b.g0.x);
+                        gobo *= g1.r * g1.a;
+                    }
+                    if (useGobo2)
+                    {
+                        float cs2 = cos(b.g1.y), sn2 = sin(b.g1.y);  // goboRot2
+                        float2 guv2 = float2(g.x * cs2 - g.y * sn2, g.x * sn2 + g.y * cs2) * 0.5 + 0.5;
+                        half4 g2 = SAMPLE_TEXTURE2D_ARRAY(_GoboArray2, sampler_GoboArray2, guv2, b.g1.x);
+                        gobo *= g2.r * g2.a;
+                    }
+                }
+
+                float intensity = intensityP * _ProjSurfaceBoost * side * axialAtt * normalFade * gobo * nearFade;
+
+            #if defined(_STAGEBEAM_SHADOWS_SCREEN) || defined(_STAGEBEAM_SHADOWS_VOLUME) || defined(_STAGEBEAM_SHADOWS_LIGHT)
+                float shadow = SampleBeamShadow(surfWS,
+                    StageBeamObjectToWorld(b, float3(0.0, 0.0, 0.0)),
+                    StageBeamIGN(i.positionHCS.xy));
+                shadow = saturate((shadow - _ProjShadowHardness) / max(1.0 - _ProjShadowHardness, 1e-3));
+                intensity *= shadow;
+            #endif
+                float3 col = b.color.rgb * intensity;
+                float lum = dot(col, float3(0.2126, 0.7152, 0.0722));
+                return half4(col, lum);
+            }
+            ENDHLSL
+        }
     }
     Fallback Off
 }

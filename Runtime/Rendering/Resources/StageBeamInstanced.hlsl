@@ -38,4 +38,10 @@ float3 StageBeamWorldToObject(GpuBeam b, float3 posWS)
     return mul(b.worldToObject, float4(posWS, 1.0)).xyz;
 }
 
+// Object->World for a DIRECTION (rotation/scale only, no translation).
+float3 StageBeamObjectToWorldDir(GpuBeam b, float3 dirOS)
+{
+    return mul((float3x3)b.objectToWorld, dirOS);
+}
+
 #endif // STAGEBEAM_INSTANCED_INCLUDED

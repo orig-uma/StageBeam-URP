@@ -46,11 +46,14 @@ namespace Origuma.StageBeam
         [Tooltip("How often to re-scan the scene for occluders, in seconds. Bounds of already-known " +
                  "occluders are refreshed every frame regardless, so moving/skinned meshes stay correct. " +
                  "Lower = runtime-spawned occluders are picked up sooner.")]
-        public float RescanInterval = 0.25f;
+        public float RescanInterval = 1.0f;
         [Tooltip("Voxelize the occluders' REAL meshes (skinned poses and cloth included) " +
                  "instead of sphere/box approximations — geometry-true silhouettes at voxel " +
                  "resolution, cost still independent of the light count.")]
         public bool MeshVoxelize = true;
+        [Tooltip("Mesh-voxelization passes (X/Y/Z). 3 = fully conservative; 2 drops the top-down " +
+                 "pass for a cheaper occlusion build (recorded draw count scales with this).")]
+        [Range(1, 3)] public int VoxelizeAxisCount = 3;
         [Tooltip("Legacy approximation (Mesh Voxelize off): emit one sphere per bone for " +
                  "skinned meshes instead of a single box.")]
         public bool ArticulateSkinnedMeshes = true;
@@ -128,6 +131,7 @@ namespace Origuma.StageBeam
             b.Occlusion              = Occlusion;
             b.OccluderMask           = OccluderMask;
             b.MeshVoxelize           = MeshVoxelize;
+            b.VoxelizeAxisCount      = VoxelizeAxisCount;
             b.RescanInterval         = RescanInterval;
             b.ArticulateSkinnedMeshes = ArticulateSkinnedMeshes;
             b.BonesPerOccluder       = BonesPerOccluder;
