@@ -1,4 +1,4 @@
-# Stage Beam — Quick Start
+# Stage Beam — 使い方 (Usage)
 
 Volumetric stage-light beams for URP. This guide gets a beam on screen in two steps, with no
 MVR/DMX/GDTF knowledge required.

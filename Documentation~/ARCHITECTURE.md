@@ -1,7 +1,7 @@
 # StageBeam 技術アーキテクチャ
 
 `com.origuma.stage-beam` の内部構造と描画パイプラインの技術解説。
-導入手順・パラメータ一覧は [QuickStart.md](QuickStart.md) を参照。
+導入手順・パラメータ一覧は [USAGE.md](USAGE.md) を参照。
 
 ## 1. レイヤ構成
 
@@ -60,7 +60,7 @@ UV がフル/半解像度どちらでも正しくなるようにしている。
 
 **Soft Additive はフル解像度でもオフスクリーン経由になる** — 天井カーブは「重なった
 ビームの合計値」を見る必要があり、これはパスごとの Blend 係数では表現できないため
-(§ [SoftAdditiveAndOptimization.md](SoftAdditiveAndOptimization.md))。
+(§ [PERFORMANCE.md](PERFORMANCE.md))。
 
 ## 3. コーンシェーダ (`Origuma/StageBeamCone`)
 
@@ -202,7 +202,7 @@ MPB に注入。**ライトが解決できないビームは自動的に Volume 
   3D テクスチャタップ。
 - **キーワード分岐**: シャドウ off ではシェーダバリアント自体にコードが乗らない。
 
-### 実装済みの最適化(詳細は [SoftAdditiveAndOptimization.md](SoftAdditiveAndOptimization.md))
+### 実装済みの最適化(詳細は [PERFORMANCE.md](PERFORMANCE.md))
 
 | 手法 | 効果 |
 |---|---|
@@ -215,7 +215,7 @@ MPB に注入。**ライトが解決できないビームは自動的に Volume 
 | ワールド固定ボクセル格子 | 被写体移動でも格子不動=再量子化シマー(チラつき)を防止 |
 | ズーム光束保存 | 立体角比 Ω(ref)/Ω(actual) で強度スケール。ワイドで薄まる物理的挙動+過剰塗りつぶし防止 |
 | メッシュボクセル化 + GrowMax/blur/EMA | 球近似を捨て実ジオメトリ影。充填で影を濃く・blur で terracing 除去・EMA でポッピング吸収 |
-| GPU インスタンシング(任意・既定 OFF) | ゴボ群ごとに1 `DrawMeshInstancedProcedural`。ドローコール(CPU)削減。フィルレートは不変なので効くのは CPU 律速時のみ。per-beam 値は頂点で読み flat varying で frag へ(per-pixel バッファ読み回避)。詳細は SoftAdditive §3.9 |
+| GPU インスタンシング(任意・既定 OFF) | ゴボ群ごとに1 `DrawMeshInstancedProcedural`。ドローコール(CPU)削減。フィルレートは不変なので効くのは CPU がボトルネックの時のみ。per-beam 値は頂点で読み flat varying で frag へ(per-pixel バッファ読み回避)。詳細は PERFORMANCE §3.9 |
 
 **実測(RTX 5060 Ti / FullHD)**: UnityChanKagura 5人 + MegaPointe 120灯で ≈90FPS
 (GPU frametime ≈7.8ms)。ワイドズームで全灯が広く重なる最悪ケースでも実用域。
