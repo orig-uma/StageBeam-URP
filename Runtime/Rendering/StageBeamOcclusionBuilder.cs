@@ -63,6 +63,15 @@ namespace Origuma.StageBeam
         // already close the body. Lower this if the occlusion build's CPU cost matters more than
         // catching perfectly horizontal surfaces (out-held arms' top faces).
         public int VoxelizeAxisCount = 3;
+        /// <summary>
+        /// Static/dynamic occluder split (opt-in perf). Voxelizes NON-moving rigid occluders into a
+        /// cached volume that's rebuilt only when that set changes, and re-voxelizes only the DYNAMIC
+        /// ones (SkinnedMeshRenderers — mesh deforms in place — and anything whose transform moved)
+        /// every build, combining them with a max pass. Kills the per-build DrawRenderer spike from
+        /// static set geometry. Fully automatic (no layers/flags): classification is by renderer type
+        /// + transform movement. MeshVoxelize only.
+        /// </summary>
+        public bool StaticDynamicSplit;
         /// <summary>Temporal smoothing of the occupancy (0 = off/instant, 1 = heavy). Absorbs the
         /// frame-to-frame voxel chatter a moving occluder causes; higher = smoother but the
         /// shadow lags moving occluders more.</summary>
@@ -120,8 +129,16 @@ namespace Origuma.StageBeam
         private Bounds _fitBounds;
         private bool _hasFit;
         private int _clearKernel = -1, _splatKernel = -1, _growKernel = -1, _dilateKernel = -1, _temporalKernel = -1;
+        private int _combineKernel = -1;
         private RenderTexture _volumeTemp;      // ping-pong for the dilate passes
         private RenderTexture _volumeHistory;   // temporal EMA of the occupancy (bound for shadowing)
+        private RenderTexture _volumeStatic;    // cached static occupancy (StaticDynamicSplit)
+        // Static/dynamic classification state (parallel to _occluders).
+        private bool[] _dynamicFlags;           // this build: skinned OR transform moved
+        private bool[] _wasDynamic;             // last build's classification (flip → static set changed)
+        private Matrix4x4[] _lastMatrices;      // last build's transform (movement detection)
+        private bool _staticDirty;              // static set changed → rebuild the static volume
+        private bool _staticVolumeValid;
         private bool _historyValid;             // false right after (re)allocation → skip the blend once
         private ComputeShader _kernelSource;
         private float _nextRescan;
@@ -141,6 +158,7 @@ namespace Origuma.StageBeam
         private static readonly int IdDensity    = Shader.PropertyToID("_BeamShadowDensity");
         // compute-side
         private static readonly int IdCOcc      = Shader.PropertyToID("_Occ");
+        private static readonly int IdCCombineOther = Shader.PropertyToID("_CombineOther");
         private static readonly int IdCSpheres  = Shader.PropertyToID("_Spheres");
         private static readonly int IdCCount    = Shader.PropertyToID("_SphereCount");
         private static readonly int IdCBoxes    = Shader.PropertyToID("_Boxes");
@@ -223,6 +241,8 @@ namespace Origuma.StageBeam
             if (_volume != null) { _volume.Release(); CoreUtils.Destroy(_volume); _volume = null; }
             if (_volumeTemp != null) { _volumeTemp.Release(); CoreUtils.Destroy(_volumeTemp); _volumeTemp = null; }
             if (_volumeHistory != null) { _volumeHistory.Release(); CoreUtils.Destroy(_volumeHistory); _volumeHistory = null; }
+            if (_volumeStatic != null) { _volumeStatic.Release(); CoreUtils.Destroy(_volumeStatic); _volumeStatic = null; }
+            _staticVolumeValid = false;
             _historyValid = false;
             _sphereBuffer?.Dispose(); _sphereBuffer = null;
             _boxBuffer?.Dispose(); _boxBuffer = null;
@@ -247,6 +267,7 @@ namespace Origuma.StageBeam
                 _growKernel = Occlusion.HasKernel("GrowMax") ? Occlusion.FindKernel("GrowMax") : -1;
                 _dilateKernel = Occlusion.HasKernel("Dilate") ? Occlusion.FindKernel("Dilate") : -1;
                 _temporalKernel = Occlusion.HasKernel("TemporalBlend") ? Occlusion.FindKernel("TemporalBlend") : -1;
+                _combineKernel = Occlusion.HasKernel("CombineMax") ? Occlusion.FindKernel("CombineMax") : -1;
             }
             return _clearKernel >= 0;
         }
@@ -289,6 +310,10 @@ namespace Origuma.StageBeam
                 _occluders[i].GetSharedMaterials(_tempMaterials);   // non-allocating
                 _occluderSubMeshes[i] = Mathf.Max(1, _tempMaterials.Count);
             }
+
+            // The occluder set (and thus per-index classification) changed → force a static rebuild.
+            _staticVolumeValid = false;
+            _lastMatrices = null;
         }
 
         private void GatherOccluders()
@@ -672,6 +697,8 @@ namespace Origuma.StageBeam
         /// geometry — skinned poses and cloth deformation included — while the shared volume
         /// keeps the cost independent of the light count.
         /// </summary>
+        private enum VoxClass { All, Static, Dynamic }
+
         private void RecordVoxelizeMeshes(CommandBuffer cmd)
         {
             if (_occluders.Count == 0 || _volume == null) return;
@@ -704,30 +731,120 @@ namespace Origuma.StageBeam
                 1f / Mathf.Max(_ws.z, 1e-3f)));
             cmd.SetGlobalVector(IdVoxRes, new Vector3(res.x, res.y, res.z));
 
-            // Decide once which occluders rasterize (active + not too big), so the per-axis loops
-            // below just read a flag instead of re-touching r.bounds three times.
-            if (_voxelizeFlags == null || _voxelizeFlags.Length < _occluders.Count)
-                _voxelizeFlags = new bool[Mathf.Max(_occluders.Count, 8)];
-            for (var i = 0; i < _occluders.Count; i++)
+            ClassifyAndFlag();
+
+            bool split = StaticDynamicSplit && _combineKernel >= 0 && _clearKernel >= 0 && EnsureStaticVolume();
+            if (split)
             {
-                var r = _occluders[i];
-                _voxelizeFlags[i] = r != null && r.enabled && r.gameObject.activeInHierarchy &&
-                    (MaxOccluderSize <= 0f || r.bounds.extents.magnitude * 2f <= MaxOccluderSize);
+                // Static occupancy is voxelized ONLY when the static set changed (rare) and cached;
+                // the dynamic occupancy (skinned performers + anything that moved) is voxelized every
+                // build. max() OR's the cached static into the fresh dynamic volume before dilation.
+                if (_staticDirty || !_staticVolumeValid)
+                {
+                    DispatchClear(cmd, _volumeStatic);
+                    VoxelizeAxes(cmd, _volumeStatic, VoxClass.Static);
+                    _staticVolumeValid = true;
+                }
+                // _volume was already cleared by RecordUploadAndDispatch (Clear + empty Splat).
+                VoxelizeAxes(cmd, _volume, VoxClass.Dynamic);
+                DispatchCombine(cmd, _volume, _volumeStatic);
+            }
+            else
+            {
+                VoxelizeAxes(cmd, _volume, VoxClass.All);
             }
 
-            cmd.SetRandomWriteTarget(1, _volume);
+            cmd.ReleaseTemporaryRT(IdVoxTargetRT);
+        }
+
+        // Per-build classification: which occluders rasterize at all (active + not too big), and
+        // which are DYNAMIC (SkinnedMeshRenderer — mesh deforms in place — or the transform moved
+        // since last build). A static↔dynamic flip means the cached static set changed → rebuild it.
+        private void ClassifyAndFlag()
+        {
+            int n = _occluders.Count;
+            if (_voxelizeFlags == null || _voxelizeFlags.Length < n) _voxelizeFlags = new bool[Mathf.Max(n, 8)];
+
+            bool doSplit = StaticDynamicSplit;
+            bool matricesReset = false;   // first build (or post-rescan) → treat every occluder as moved
+            if (doSplit)
+            {
+                if (_dynamicFlags == null || _dynamicFlags.Length < n)
+                {
+                    _dynamicFlags = new bool[Mathf.Max(n, 8)];
+                    _wasDynamic  = new bool[Mathf.Max(n, 8)];
+                }
+                matricesReset = _lastMatrices == null || _lastMatrices.Length < n;
+                if (matricesReset) _lastMatrices = new Matrix4x4[Mathf.Max(n, 8)];
+            }
+
+            _staticDirty = false;
+            for (var i = 0; i < n; i++)
+            {
+                var r = _occluders[i];
+                bool active = r != null && r.enabled && r.gameObject.activeInHierarchy;
+                _voxelizeFlags[i] = active &&
+                    (MaxOccluderSize <= 0f || r.bounds.extents.magnitude * 2f <= MaxOccluderSize);
+
+                if (!doSplit) continue;   // dynamic classification only needed for the split
+                Matrix4x4 m = r != null ? r.transform.localToWorldMatrix : Matrix4x4.identity;
+                bool moved = matricesReset || m != _lastMatrices[i];
+                _lastMatrices[i] = m;
+                bool dyn = active && ((r is SkinnedMeshRenderer) || moved);
+                if (dyn != _wasDynamic[i]) _staticDirty = true;
+                _dynamicFlags[i] = dyn;
+                _wasDynamic[i]   = dyn;
+            }
+        }
+
+        private bool EnsureStaticVolume()
+        {
+            if (_volume == null) return false;
+            if (_volumeStatic == null || _volumeStatic.width != _volume.width ||
+                _volumeStatic.height != _volume.height || _volumeStatic.volumeDepth != _volume.volumeDepth)
+            {
+                if (_volumeStatic != null) { _volumeStatic.Release(); CoreUtils.Destroy(_volumeStatic); }
+                _volumeStatic = new RenderTexture(_volume.descriptor) { name = "StageBeamOccStatic" };
+                _volumeStatic.Create();
+                _staticVolumeValid = false;
+            }
+            return true;
+        }
+
+        private void DispatchClear(CommandBuffer cmd, RenderTexture vol)
+        {
+            var res = Resolution;
+            cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
+            cmd.SetComputeTextureParam(Occlusion, _clearKernel, IdCOcc, vol);
+            cmd.DispatchCompute(Occlusion, _clearKernel,
+                Mathf.CeilToInt(res.x / 4f), Mathf.CeilToInt(res.y / 4f), Mathf.CeilToInt(res.z / 4f));
+        }
+
+        private void DispatchCombine(CommandBuffer cmd, RenderTexture target, RenderTexture other)
+        {
+            var res = Resolution;
+            cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
+            cmd.SetComputeTextureParam(Occlusion, _combineKernel, IdCOcc, target);
+            cmd.SetComputeTextureParam(Occlusion, _combineKernel, IdCCombineOther, other);
+            cmd.DispatchCompute(Occlusion, _combineKernel,
+                Mathf.CeilToInt(res.x / 4f), Mathf.CeilToInt(res.y / 4f), Mathf.CeilToInt(res.z / 4f));
+        }
+
+        // Rasterize a class of occluders into <paramref name="target"/> over the axis passes.
+        private void VoxelizeAxes(CommandBuffer cmd, RenderTexture target, VoxClass cls)
+        {
+            cmd.SetRandomWriteTarget(1, target);
             // 3 axes = fully conservative; 2 drops the top-down pass; 1 keeps only the side pass.
             int axes = Mathf.Clamp(VoxelizeAxisCount, 1, 3);
-            DrawAxis(cmd, Vector3.right,   Vector3.up,      new Vector2(_ws.z, _ws.y), _ws.x);
-            if (axes >= 3) DrawAxis(cmd, Vector3.up, Vector3.forward, new Vector2(_ws.x, _ws.z), _ws.y);
-            if (axes >= 2) DrawAxis(cmd, Vector3.forward, Vector3.up, new Vector2(_ws.x, _ws.y), _ws.z);
+            DrawAxis(cmd, Vector3.right,   Vector3.up,      new Vector2(_ws.z, _ws.y), _ws.x, cls);
+            if (axes >= 3) DrawAxis(cmd, Vector3.up, Vector3.forward, new Vector2(_ws.x, _ws.z), _ws.y, cls);
+            if (axes >= 2) DrawAxis(cmd, Vector3.forward, Vector3.up, new Vector2(_ws.x, _ws.y), _ws.z, cls);
             cmd.ClearRandomWriteTargets();
-            cmd.ReleaseTemporaryRT(IdVoxTargetRT);
         }
 
         // One orthographic pass over the box along +axis: camera sits outside the min face
         // looking down the axis, frustum exactly covering the box's cross-section.
-        private void DrawAxis(CommandBuffer cmd, Vector3 axis, Vector3 up, Vector2 extent, float depth)
+        private void DrawAxis(CommandBuffer cmd, Vector3 axis, Vector3 up, Vector2 extent, float depth, VoxClass cls)
         {
             var camPos = _wc - axis * (depth * 0.5f + 0.5f);
             var rot = Quaternion.LookRotation(axis, up);
@@ -742,8 +859,10 @@ namespace Origuma.StageBeam
 
             for (var i = 0; i < _occluders.Count; i++)
             {
-                // Precomputed once per build in RecordVoxelizeMeshes (active + not too big).
+                // Active + not-too-big (from ClassifyAndFlag), then the requested static/dynamic class.
                 if (_voxelizeFlags == null || i >= _voxelizeFlags.Length || !_voxelizeFlags[i]) continue;
+                if (cls == VoxClass.Static  &&  _dynamicFlags[i]) continue;
+                if (cls == VoxClass.Dynamic && !_dynamicFlags[i]) continue;
                 var r = _occluders[i];
                 int subs = _occluderSubMeshes != null && i < _occluderSubMeshes.Length
                     ? _occluderSubMeshes[i] : 1;

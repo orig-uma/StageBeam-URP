@@ -147,6 +147,11 @@ namespace Origuma.StageBeam
                  "count scales with this) and usually enough for upright performers. Lower if the " +
                  "build's CPU cost matters more than catching perfectly horizontal surfaces.")]
         [Range(1, 3)] [SerializeField] private int _volVoxelizeAxes = 3;
+        [Tooltip("Static/dynamic occluder split (perf). Voxelizes non-moving rigid occluders once " +
+                 "into a cached volume and re-voxelizes only dynamic ones (skinned performers + " +
+                 "anything that moved) each build — killing the per-build draw spike from static " +
+                 "set geometry. Fully automatic (no layers). MeshVoxelize only.")]
+        [SerializeField] private bool _volStaticDynamicSplit;
         [Tooltip("0 = no shadow, 1 = fully black in occluded regions.")]
         [Range(0f, 1f)] [SerializeField] private float _volStrength = 1f;
         [Tooltip("Occluder opacity per metre along the shadow ray (Beer-Lambert extinction). " +
@@ -193,6 +198,7 @@ namespace Origuma.StageBeam
         private StageBeamOcclusionBuilder _occlusionBuilder;
         private int _occlusionBuiltFrame = -1;
         private static bool _warnedInstancingBypass;   // LightShadowMap + instancing warn-once
+        private bool _warnedOverride;                   // scene OcclusionVolume overriding the feature
 
         private static readonly int IdBeamRTParams      = Shader.PropertyToID("_BeamRTParams");
         private static readonly int IdUpsampleTexelSize = Shader.PropertyToID("_BeamUpsampleTexelSize");
@@ -367,20 +373,48 @@ namespace Origuma.StageBeam
             if (overrideVol != null)
             {
                 if (_occlusionBuilder != null) { _occlusionBuilder.Release(false); _occlusionBuilder = null; }
-                return overrideVol.ConfigureBuilder();
+                var ob = overrideVol.ConfigureBuilder();   // component pins the box + advanced knobs
+                if (overrideVol.Mode == StageBeamOcclusionVolume.SettingsMode.UseRendererFeatureSettings)
+                {
+                    // Default: the main shadow behaviour still comes from the feature, so editing
+                    // the feature keeps working even with an override present (it only pins the box).
+                    ApplyFeatureOcclusionSettings(ob);
+                    _warnedOverride = false;
+                }
+                else if (!_warnedOverride)
+                {
+                    _warnedOverride = true;
+                    // Info, not a warning — this is an intentional mode, so don't look like an error.
+                    Debug.Log("<color=#5aa9e6>[StageBeam]</color> A StageBeamOcclusionVolume is in " +
+                        "Override mode — it owns the occlusion settings and the Renderer Feature's " +
+                        "occlusion fields are ignored. Set it to \"Use Renderer Feature Settings\" to " +
+                        "drive occlusion from the feature.", overrideVol);
+                }
+                return ob;
             }
+
+            _warnedOverride = false;   // no override active → re-arm the override-mode notice
 
             _occlusionBuilder ??= new StageBeamOcclusionBuilder();
             var b = _occlusionBuilder;
-            b.OccluderMask      = _occluderMask;
-            b.MeshVoxelize      = _volMeshVoxelize;
-            b.VoxelizeAxisCount = _volVoxelizeAxes;
-            b.Strength          = _volStrength;
-            b.ShadowDensity     = _volDensity;
-            b.ShadowSteps       = _volSteps;
-            b.MaxShadowDistance = _volMaxDistance;
-            b.TemporalSmoothing = _volTemporal;
+            ApplyFeatureOcclusionSettings(b);
             return b;
+        }
+
+        // The feature's occlusion behaviour, applied to a builder. Shared by the auto path and by
+        // an override component running in "Use Renderer Feature Settings" mode (which pins only the
+        // box, then lets these drive the shadow behaviour).
+        private void ApplyFeatureOcclusionSettings(StageBeamOcclusionBuilder b)
+        {
+            b.OccluderMask       = _occluderMask;
+            b.MeshVoxelize       = _volMeshVoxelize;
+            b.VoxelizeAxisCount  = _volVoxelizeAxes;
+            b.StaticDynamicSplit = _volStaticDynamicSplit;
+            b.Strength           = _volStrength;
+            b.ShadowDensity      = _volDensity;
+            b.ShadowSteps        = _volSteps;
+            b.MaxShadowDistance  = _volMaxDistance;
+            b.TemporalSmoothing  = _volTemporal;
         }
 
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)

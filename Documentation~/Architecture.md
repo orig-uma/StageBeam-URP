@@ -13,7 +13,6 @@
 │  StageBeamInstance     ビーム1本の全パラメータ (UnityEngine型のみ) │
 │  StageBeamLight        手置き用ソース (MonoBehaviour, 1個=1本)   │
 │  StageBeamDriver       全ソースを収集しキューへ変換               │
-│  StageBeamLens         レンズ面の HDR エミッシブ (Bloom でグレア)  │
 ├─ Rendering 層 (Runtime/Rendering) ──────────────────────────┤
 │  StageBeamQueue            フレームごとの {Matrix, MPB} キュー    │
 │  StageBeamRendererFeature  URP RenderGraph パス群               │
@@ -185,23 +184,7 @@ MPB に注入。**ライトが解決できないビームは自動的に Volume 
 グレースケール = 実際に適用された減衰比 (sum/sumRaw)。
 「ボリューム未バインド / レイ未達 / 強度未反映 / 知覚問題」を段階的に切り分ける。
 
-## 5. レンズグロー (`StageBeamLens`)
-
-ビルボードコロナは使わず、レンズ面自体を HDR エミッシブにして URP Bloom に
-グレアを任せる。
-
-- ターゲット Renderer 未指定なら `GetComponent<Renderer>()`、それも無ければ
-  -Y 向きのレンズ円盤メッシュを自動生成(`Origuma/StageBeamLens` シェーダ、
-  Fresnel 減衰)。
-- 適用は MaterialPropertyBlock のみ(マテリアル非複製)。`_LensColor` /
-  `_LensIntensity` に加え `_EmissionColor` も設定するため、標準の Lit/emissive
-  マテリアルでも反応する。
-- `SetState(color, intensity)` で外部ドライバ(例: mvr-toolkit の
-  `MvrLensEmissiveSync`)が毎フレーム駆動可能。フレームスタンプ方式で
-  「今 or 前フレーム」の SetState を優先し、無ければシリアライズ値へフォールバック
-  (LateUpdate 実行順が不定でも駆動側が勝つ)。
-
-## 6. リソース戦略
+## 5. リソース戦略
 
 シェーダ4本・compute・ヘイズノイズ(HazeFBM3D)はすべて
 `Runtime/Rendering/Resources/` に置き、`Shader.Find` / `Resources.Load` で解決する。
@@ -209,7 +192,7 @@ MPB に注入。**ライトが解決できないビームは自動的に Volume 
 プロジェクト設定が不要になる。マテリアルとコーンメッシュはランタイム生成
 (`StageBeamDriver.EnsureResources` / `CoreUtils.CreateEngineMaterial`)。
 
-## 7. パフォーマンス特性
+## 6. パフォーマンス特性
 
 - **CPU**: ビーム1本あたり MPB 書き込みのみ(プール済み、GC ゼロ)。
   `Shader.PropertyToID` は全て static キャッシュ。
@@ -237,7 +220,7 @@ MPB に注入。**ライトが解決できないビームは自動的に Volume 
 **実測(RTX 5060 Ti / FullHD)**: UnityChanKagura 5人 + MegaPointe 120灯で ≈90FPS
 (GPU frametime ≈7.8ms)。ワイドズームで全灯が広く重なる最悪ケースでも実用域。
 
-## 8. 拡張ポイント
+## 7. 拡張ポイント
 
 - **新しいビーム供給者**: `IStageBeamSource.CollectBeams(List<StageBeamInstance>)`
   を実装し、`StageBeamDriver.EnsureInstance().AddSource(this)` / `RemoveSource(this)`

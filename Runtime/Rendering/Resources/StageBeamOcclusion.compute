@@ -11,6 +11,7 @@
 #pragma kernel GrowMax
 #pragma kernel Dilate
 #pragma kernel TemporalBlend
+#pragma kernel CombineMax
 
 RWTexture3D<float> _Occ;           // R16F occupancy, 0 = clear, 1 = solid
 StructuredBuffer<float4> _Spheres; // xyz = centre (world), w = radius
@@ -150,4 +151,16 @@ void TemporalBlend(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= _Res)) return;
     _Occ[id] = lerp(_Occ[id], _Current[id], _TemporalAlpha);
+}
+
+// Static/dynamic split: the CACHED static occupancy (voxelized only when the static set changes)
+// is OR'd into the fresh per-build dynamic occupancy via max, so the combined volume feeds the
+// usual dilate/blur/temporal — while the expensive static mesh voxelization is skipped most frames.
+Texture3D<float> _CombineOther;
+
+[numthreads(4,4,4)]
+void CombineMax(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _Res)) return;
+    _Occ[id] = max(_Occ[id], _CombineOther[id]);
 }

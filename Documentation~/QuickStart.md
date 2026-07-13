@@ -236,26 +236,6 @@ the known next step is a single froxel-grid compute pass (cluster the cones into
 renderer replacement, not a tweak — the `IStageBeamSource`/`StageBeamInstance` contract is
 deliberately renderer-neutral so it can slot in without touching any beam sources.
 
-## Lens glow
-
-Fixture lenses don't use billboard corona sprites — the lens surface itself glows with an HDR
-emissive colour (shader `Origuma/StageBeamLens`), and URP Bloom supplies the glare on screen.
-
-1. Add a **Stage Beam Lens** component (`Add Component > Stage Beam / Stage Beam Lens`) to your
-   fixture, ideally on (or targeting) the lens mesh.
-2. Leave **Target Renderer** unset to auto-use `GetComponent<Renderer>()`, or assign one
-   explicitly. If neither exists, a small flat disc ("Lens Disc") is generated as a child facing
-   local **-Y** (the same beam-exit axis as `StageBeamLight`).
-3. Set **Color** / **Intensity** for the standalone/manual path, or drive it every frame from
-   code via `SetState(color, intensity)` — this is what `com.origuma.mvr-toolkit`'s
-   `MvrLensEmissiveSync` does per DMX-driven cell. `SetState` calls made this frame take
-   precedence over the serialized Inspector values.
-4. Make sure **Bloom** is enabled on the camera's URP Volume — without it the emissive lens is
-   just a bright disc, no glare.
-
-`Emissive Boost` is an extra HDR multiplier on top of Color × Intensity so the lens reliably
-clears the Bloom threshold even at Intensity = 1.
-
 ## Two integration levels
 
 - **Drop-in** (`StageBeamLight`): the component covered by this guide. Zero external knowledge —

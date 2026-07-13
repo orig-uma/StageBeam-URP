@@ -20,6 +20,24 @@ namespace Origuma.StageBeam
         /// feature builds the volume itself).</summary>
         public static StageBeamOcclusionVolume Active { get; private set; }
 
+        /// <summary>How this component's shadow settings interact with the Renderer Feature's.</summary>
+        public enum SettingsMode
+        {
+            /// <summary>Default. This component only pins the volume BOX (manual region / no AutoFit)
+            /// and the advanced knobs; the MAIN shadow behaviour (occluder mask, density, steps,
+            /// mesh voxelize, axis count, static/dynamic split, strength, temporal, max distance)
+            /// still comes from the Renderer Feature — so editing the feature keeps working.</summary>
+            UseRendererFeatureSettings,
+            /// <summary>This component owns EVERYTHING — the Renderer Feature's occlusion settings
+            /// are fully ignored while it's present.</summary>
+            Override,
+        }
+
+        [Tooltip("Use Renderer Feature Settings (default): this component only sets the volume box/" +
+                 "region — the main shadow behaviour still comes from the Renderer Feature. " +
+                 "Override: this component owns all occlusion settings (feature's are ignored).")]
+        public SettingsMode Mode = SettingsMode.UseRendererFeatureSettings;
+
         [Header("Compute")]
         [Tooltip("StageBeamOcclusion.compute. Leave empty to auto-load the one bundled with " +
                  "the package — no manual assignment needed.")]
@@ -54,6 +72,9 @@ namespace Origuma.StageBeam
         [Tooltip("Mesh-voxelization passes (X/Y/Z). 3 = fully conservative; 2 drops the top-down " +
                  "pass for a cheaper occlusion build (recorded draw count scales with this).")]
         [Range(1, 3)] public int VoxelizeAxisCount = 3;
+        [Tooltip("Static/dynamic split (perf): voxelize non-moving occluders once (cached), " +
+                 "re-voxelize only dynamic ones each build. Automatic classification. MeshVoxelize only.")]
+        public bool StaticDynamicSplit;
         [Tooltip("Legacy approximation (Mesh Voxelize off): emit one sphere per bone for " +
                  "skinned meshes instead of a single box.")]
         public bool ArticulateSkinnedMeshes = true;
@@ -132,6 +153,7 @@ namespace Origuma.StageBeam
             b.OccluderMask           = OccluderMask;
             b.MeshVoxelize           = MeshVoxelize;
             b.VoxelizeAxisCount      = VoxelizeAxisCount;
+            b.StaticDynamicSplit     = StaticDynamicSplit;
             b.RescanInterval         = RescanInterval;
             b.ArticulateSkinnedMeshes = ArticulateSkinnedMeshes;
             b.BonesPerOccluder       = BonesPerOccluder;

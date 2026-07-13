@@ -39,15 +39,6 @@ feature setup, adding a beam, the full parameter reference, and a performance gu
   MVR/DMX rig) into a `StageBeamDriver` — this is how `com.origuma.mvr-toolkit`'s `MvrBeamSource`
   integrates. StageBeam has no dependency in that direction; it only depends on the interface.
 
-## Lens glow
-
-No billboard corona sprites — the fixture's lens surface itself glows with an HDR emissive
-colour, and URP Bloom supplies the glare. Add a `Stage Beam Lens` component
-(`Add Component > Stage Beam / Stage Beam Lens`) to your fixture's lens mesh, or leave
-`Target Renderer` unset to auto-generate a small glowing disc. Enable **Bloom** on your camera's
-URP Volume for the glare to actually show up. See
-[Documentation~/QuickStart.md](Documentation~/QuickStart.md#lens-glow) for details.
-
 ## Requirements
 
 - Unity 6000.0+
