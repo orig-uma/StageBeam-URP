@@ -15,6 +15,7 @@ Shader "Origuma/StageBeamProjection"
         _AxialFalloff  ("Axial Falloff", Range(0, 2)) = 1.0
         _GoboSlice   ("Gobo Slice (-1=off)", Float) = -1
         _GoboRotation("Gobo Rotation (rad)", Float) = 0
+        _GoboOffset  ("Gobo 1 UV Offset (animation wheel)", Vector) = (0,0,0,0)
         [NoScaleOffset] _GoboArray ("Gobo Array", 2DArray) = "white" {}
         _GoboSlice2   ("Gobo Slice 2 (-1=off)", Float) = -1
         _GoboRotation2("Gobo Rotation 2 (rad)", Float) = 0
@@ -36,7 +37,9 @@ Shader "Origuma/StageBeamProjection"
             HLSLPROGRAM
             #pragma vertex vert
             #pragma fragment frag
-            #pragma multi_compile _ _STAGEBEAM_SHADOWS_SCREEN _STAGEBEAM_SHADOWS_VOLUME
+            #pragma multi_compile _ _STAGEBEAM_SHADOWS_SCREEN _STAGEBEAM_SHADOWS_VOLUME _STAGEBEAM_SHADOWS_LIGHT
+            #pragma multi_compile_fragment _ _ADDITIONAL_LIGHT_SHADOWS
+            #pragma multi_compile_fragment _ _SHADOWS_SOFT
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
             #include "StageBeamShadow.hlsl"
@@ -52,6 +55,7 @@ Shader "Origuma/StageBeamProjection"
                 float  _AxialFalloff;
                 float  _GoboSlice;
                 float  _GoboRotation;
+                float4 _GoboOffset;
                 float  _GoboSlice2;
                 float  _GoboRotation2;
             CBUFFER_END
@@ -59,8 +63,14 @@ Shader "Origuma/StageBeamProjection"
             // Projection-wide knobs (set globally by the renderer feature).
             float _ProjSurfaceBoost;   // brightness multiplier for the projected pool
             float _ProjNormalCull;     // 0..1 cosine band: surfaces steeper than this fade out
-            // TODO layer-ignore: sample _CameraRenderingLayersTexture and mask here once URP
-            // "Rendering Layers" is enabled on the renderer.
+            float _ProjShadowHardness; // 0 = raw soft shadow, higher = occluded pool → fully black
+
+            // Receiver layer mask: a depth-only pre-pass of ONLY the receiver layers. A pixel
+            // receives projection only when the visible surface IS that receiver surface
+            // (depths match) — a character (excluded layer) standing in the pool stays clean.
+            float _ProjReceiverMaskOn;
+            TEXTURE2D_X(_StageBeamReceiverDepth);
+            SAMPLER(sampler_StageBeamReceiverDepth);
 
             TEXTURE2D_ARRAY(_GoboArray);  SAMPLER(sampler_GoboArray);
             TEXTURE2D_ARRAY(_GoboArray2); SAMPLER(sampler_GoboArray2);
@@ -86,6 +96,19 @@ Shader "Origuma/StageBeamProjection"
 
                 // Reconstruct the lit surface in world space from the camera depth.
                 float deviceDepth = SampleSceneDepth(uv);
+
+                // Receiver mask: only paint pixels whose visible surface is on a receiver
+                // layer (its depth matches the receiver-only depth pre-pass; anything in
+                // front of the receivers — e.g. a character — mismatches and is skipped).
+                if (_ProjReceiverMaskOn > 0.5)
+                {
+                    float recvDevice = SAMPLE_TEXTURE2D_X(_StageBeamReceiverDepth,
+                        sampler_StageBeamReceiverDepth, uv).r;
+                    float sceneEye = LinearEyeDepth(deviceDepth, _ZBufferParams);
+                    float recvEye  = LinearEyeDepth(recvDevice, _ZBufferParams);
+                    if (abs(sceneEye - recvEye) > 0.02 * sceneEye + 0.02) return 0;
+                }
+
                 float3 surfWS = ComputeWorldSpacePosition(uv, deviceDepth, UNITY_MATRIX_I_VP);
 
                 // Into the beam's object space (axis = -Y, radius grows with axis). Sky /
@@ -112,8 +135,21 @@ Shader "Origuma/StageBeamProjection"
                 float axNorm = axis / _Range;
                 float axialAtt = saturate(1.0 - axNorm * axNorm * _AxialFalloff);
 
-                // Normal culling: geometric normal from depth; fade out steep / back faces.
-                float3 nWS = normalize(cross(ddy(surfWS), ddx(surfWS)));
+                // Normal culling: geometric normal from depth. Plain ddx/ddy quad derivatives
+                // get noisy on curved surfaces, at depth edges and at grazing angles — pick the
+                // horizontal/vertical neighbour with the SMALLER position jump instead (min-diff
+                // reconstruction), which stays stable across curvature and silhouettes.
+                float2 px = float2(1.0 / _ScreenParams.x, 0.0);
+                float2 py = float2(0.0, 1.0 / _ScreenParams.y);
+                float3 posR = ComputeWorldSpacePosition(uv + px, SampleSceneDepth(uv + px), UNITY_MATRIX_I_VP);
+                float3 posL = ComputeWorldSpacePosition(uv - px, SampleSceneDepth(uv - px), UNITY_MATRIX_I_VP);
+                float3 posU = ComputeWorldSpacePosition(uv + py, SampleSceneDepth(uv + py), UNITY_MATRIX_I_VP);
+                float3 posD = ComputeWorldSpacePosition(uv - py, SampleSceneDepth(uv - py), UNITY_MATRIX_I_VP);
+                float3 dX = length(posR - surfWS) < length(surfWS - posL) ? posR - surfWS : surfWS - posL;
+                float3 dY = length(posU - surfWS) < length(surfWS - posD) ? posU - surfWS : surfWS - posD;
+                float3 nWS = normalize(cross(dY, dX));
+                // Orientation-independent: a visible surface's normal faces the camera.
+                if (dot(nWS, GetCameraPositionWS() - surfWS) < 0.0) nWS = -nWS;
                 float3 beamDownWS = normalize(TransformObjectToWorldDir(float3(0, -1, 0)));
                 float facing = dot(nWS, -beamDownWS);       // 1 = facing the lens, <0 = away
                 float normalFade = smoothstep(0.0, max(_ProjNormalCull, 1e-3), facing);
@@ -125,28 +161,54 @@ Shader "Origuma/StageBeamProjection"
                 bool useGobo2 = _GoboSlice2 >= 0.0;
                 if (useGobo || useGobo2)
                 {
-                    float2 g = (pOS.xz / axis) / tanField;   // [-1,1] across the field
+                    // [-1,1] across the field. Normalised by the SAME cone width as the
+                    // volumetric shader (axis·tan + StartRadius) so the projected pattern's
+                    // size matches the beam exactly, including close to the fixture.
+                    float2 g = pOS.xz / max(coneR, 1e-5);
                     if (useGobo)
                     {
                         float cs = cos(_GoboRotation), sn = sin(_GoboRotation);
                         float2 guv = float2(g.x * cs - g.y * sn, g.x * sn + g.y * cs) * 0.5 + 0.5;
-                        gobo *= SAMPLE_TEXTURE2D_ARRAY(_GoboArray, sampler_GoboArray, guv, _GoboSlice).r;
+                        // Animation wheel scroll (matches the cone shader): tile via frac() ONLY
+                        // while scrolling — a static gobo must respect the sampler's Clamp
+                        // (frac() wraps uv 1.0 to 0.0 and bilinear bleeds the opposite edge).
+                        if (abs(_GoboOffset.x) + abs(_GoboOffset.y) > 1e-5)
+                            guv = frac(guv + _GoboOffset.xy);
+                        half4 g1 = SAMPLE_TEXTURE2D_ARRAY(_GoboArray, sampler_GoboArray, guv, _GoboSlice);
+                        // Alpha = coverage (transparent outside the aperture blocks light).
+                        gobo *= g1.r * g1.a;
                     }
                     if (useGobo2)
                     {
                         float cs2 = cos(_GoboRotation2), sn2 = sin(_GoboRotation2);
                         float2 guv2 = float2(g.x * cs2 - g.y * sn2, g.x * sn2 + g.y * cs2) * 0.5 + 0.5;
-                        gobo *= SAMPLE_TEXTURE2D_ARRAY(_GoboArray2, sampler_GoboArray2, guv2, _GoboSlice2).r;
+                        half4 g2 = SAMPLE_TEXTURE2D_ARRAY(_GoboArray2, sampler_GoboArray2, guv2, _GoboSlice2);
+                        gobo *= g2.r * g2.a;
                     }
                 }
 
                 float intensity = _Intensity * _ProjSurfaceBoost * side * axialAtt * normalFade * gobo * nearFade;
 
-            #if defined(_STAGEBEAM_SHADOWS_SCREEN) || defined(_STAGEBEAM_SHADOWS_VOLUME)
+            #if defined(_STAGEBEAM_SHADOWS_SCREEN) || defined(_STAGEBEAM_SHADOWS_VOLUME) || defined(_STAGEBEAM_SHADOWS_LIGHT)
                 // Shadow the light pool where the occluder blocks the beam from the surface point.
-                intensity *= SampleBeamShadow(surfWS, TransformObjectToWorld(float3(0.0, 0.0, 0.0)));
+                float shadow = SampleBeamShadow(surfWS,
+                    TransformObjectToWorld(float3(0.0, 0.0, 0.0)),
+                    StageBeamIGN(i.positionHCS.xy));
+                // The volumetric shadow is a soft transmittance (exp falloff) that never quite
+                // reaches 0, so a sharp gobo pool keeps a faint residual even when fully blocked.
+                // Remap so transmittance below the hardness threshold clamps to fully black — a
+                // crisp hard shadow on the floor, with complete occlusion possible.
+                shadow = saturate((shadow - _ProjShadowHardness) / max(1.0 - _ProjShadowHardness, 1e-3));
+                intensity *= shadow;
             #endif
-                return half4(_BeamColor.rgb * intensity, 1.0);
+                float3 col = _BeamColor.rgb * intensity;
+                // Soft Additive accumulates pools raw into an offscreen buffer and the composite
+                // saturates the SUMMED total toward the ceiling — so pools stop at the same thin
+                // ceiling as the beams instead of piling to white (which bloom/ACES then wreck).
+                // Alpha carries this pool's luminance so the composite's ratio math is a no-op
+                // for decals (m ≈ 1) and the ceiling applies straight to the summed colour.
+                float lum = dot(col, float3(0.2126, 0.7152, 0.0722));
+                return half4(col, lum);
             }
             ENDHLSL
         }

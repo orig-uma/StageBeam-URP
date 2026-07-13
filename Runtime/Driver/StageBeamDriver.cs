@@ -20,15 +20,37 @@ namespace Origuma.StageBeam
         /// (screen blend) adds less where the background is already bright, so it saturates gently.</summary>
         public enum BeamBlend { Additive, SoftAdditive }
 
-        [Tooltip("Override material (must use Origuma/StageBeamCone). Auto-created if null.")]
+        [Tooltip("Override material (must use Origuma/StageBeamCone). Leave empty: a runtime " +
+                 "instance is created automatically on first use and shown here.")]
         public Material Material;
 
         [Tooltip("Additive = classic (can blow out on overlap). Soft Additive = screen blend, " +
                  "saturates gently. (Full-resolution path.)")]
-        public BeamBlend Blend = BeamBlend.Additive;
+        // Soft Additive by default: real beams saturate toward the source colour instead of
+        // stacking to pure white.
+        public BeamBlend Blend = BeamBlend.SoftAdditive;
+
+        [Tooltip("Soft Additive: the TOTAL brightness stacked beams may reach (the haze " +
+                 "ceiling). One beam looks the same; overlaps saturate toward this value, so " +
+                 "performers inside the light stay visible. 0.3–0.6 keeps a thin, fog-like read.")]
+        [Range(0.05f, 1.5f)] public float SoftMaxBrightness = 0.5f;
+
+        [Tooltip("Scale raymarch steps DOWN as a beam zooms wide (reference 20° field): a wide " +
+                 "cone covers far more pixels but is dimmer and softer per flux conservation, " +
+                 "so it tolerates fewer samples — this keeps the wide-zoom fill-rate cost from " +
+                 "exploding. Floor of 8 steps; ×0.5 at 40°+.")]
+        public bool AdaptiveSteps = true;
 
         [Tooltip("Radial segments of the shared cone mesh.")]
         [Range(6, 64)] public int Segments = 24;
+
+        [Tooltip("Draw beams via GPU instancing (one DrawMeshInstancedProcedural per gobo group) " +
+                 "instead of one DrawMesh per beam. Cuts CPU/draw-call overhead at high light counts. " +
+                 "The fragment (fill-rate) cost is the same — per-beam data is passed to the fragment " +
+                 "via interpolators, not a per-pixel buffer read — so this is roughly parity at low " +
+                 "counts and a slight win at high counts (draw-call bound). Volume/Screen/no-shadow " +
+                 "only (not LightShadowMap). Off = the classic per-beam path.")]
+        public bool GpuInstancing;
 
         /// <summary>All sources currently feeding this driver.</summary>
         public IReadOnlyList<IStageBeamSource> Sources => _sources;
@@ -38,11 +60,13 @@ namespace Origuma.StageBeam
         private readonly List<IStageBeamSource> _sources = new List<IStageBeamSource>();
         private Mesh _cone;
         private Material _mat;
+        private bool _ownsMat;
         private int _builtSegments = -1;
         private BeamBlend _appliedBlend = (BeamBlend)(-1);
 
         private static readonly int IdSrcBlend = Shader.PropertyToID("_BeamSrcBlend");
         private static readonly int IdDstBlend = Shader.PropertyToID("_BeamDstBlend");
+        private static readonly int IdBeamSoft = Shader.PropertyToID("_BeamSoft");
 
         private readonly List<StageBeamInstance> _instances = new List<StageBeamInstance>(64);
         private readonly List<MaterialPropertyBlock> _mpbPool = new List<MaterialPropertyBlock>();
@@ -57,6 +81,7 @@ namespace Origuma.StageBeam
         private static readonly int IdFieldHalf      = Shader.PropertyToID("_FieldHalf");
         private static readonly int IdBeamHalf       = Shader.PropertyToID("_BeamHalf");
         private static readonly int IdDensity        = Shader.PropertyToID("_Density");
+        private static readonly int IdAnisotropy     = Shader.PropertyToID("_Anisotropy");
         private static readonly int IdSteps          = Shader.PropertyToID("_Steps");
         private static readonly int IdDepthOcclude   = Shader.PropertyToID("_DepthOcclude");
         private static readonly int IdAxialFalloff   = Shader.PropertyToID("_AxialFalloff");
@@ -70,6 +95,7 @@ namespace Origuma.StageBeam
         private static readonly int IdGoboSlice2     = Shader.PropertyToID("_GoboSlice2");
         private static readonly int IdGoboRot2       = Shader.PropertyToID("_GoboRotation2");
         private static readonly int IdGoboArray2     = Shader.PropertyToID("_GoboArray2");
+        private static readonly int IdGoboOffset     = Shader.PropertyToID("_GoboOffset");
         private static readonly int IdBeamFrameIndex = Shader.PropertyToID("_BeamFrameIndex");
 
         /// <summary>Add a beam data source (no-op if already added).</summary>
@@ -97,7 +123,7 @@ namespace Origuma.StageBeam
         {
             if (_instance != null) return _instance;
 
-            _instance = FindFirstObjectByType<StageBeamDriver>();
+            _instance = FindAnyObjectByType<StageBeamDriver>();
             if (_instance == null)
             {
                 var go = new GameObject("Stage Beam Driver");
@@ -114,8 +140,14 @@ namespace Origuma.StageBeam
             StageBeamQueue.Mesh = null;
             StageBeamQueue.Material = null;
             if (_cone != null) Destroy(_cone);
-            if (_mat != null && _mat != Material) Destroy(_mat);
+            if (_ownsMat && _mat != null)
+            {
+                if (Material == _mat) Material = null;   // don't leave a destroyed ref visible
+                Destroy(_mat);
+            }
+            _ownsMat = false;
             _cone = null; _mat = null; _builtSegments = -1;
+            _appliedBlend = (BeamBlend)(-1);             // re-apply blend to the next material
         }
 
         private void OnDestroy()
@@ -135,6 +167,7 @@ namespace Origuma.StageBeam
             Shader.SetGlobalFloat(IdBeamFrameIndex, Time.frameCount);
             StageBeamQueue.Mesh = _cone;
             StageBeamQueue.Material = _mat;
+            StageBeamQueue.Instancing = GpuInstancing;
             StageBeamQueue.Begin();
             _mpbUsed = 0;
 
@@ -152,7 +185,18 @@ namespace Origuma.StageBeam
                 mpb.SetFloat(IdFieldHalf, d.FieldHalfAngleRad);
                 mpb.SetFloat(IdBeamHalf, d.BeamHalfAngleRad);
                 mpb.SetFloat(IdDensity, d.Density);
-                mpb.SetFloat(IdSteps, d.RaymarchSteps);
+                mpb.SetFloat(IdAnisotropy, d.Anisotropy);
+                float steps = d.RaymarchSteps;
+                if (AdaptiveSteps)
+                {
+                    // Wide zoom covers ~(angle ratio)² more pixels; spend proportionally fewer
+                    // samples per pixel (the wide beam is dimmer + softer, so it can afford it).
+                    const float RefHalfRad = 10f * Mathf.Deg2Rad;   // 20° field reference
+                    float scale = Mathf.Clamp(RefHalfRad / Mathf.Max(d.FieldHalfAngleRad, 1e-3f),
+                                              0.5f, 1f);
+                    steps = Mathf.Max(8f, Mathf.Round(steps * scale));
+                }
+                mpb.SetFloat(IdSteps, steps);
                 mpb.SetFloat(IdDepthOcclude, d.DepthOcclude);
                 mpb.SetFloat(IdAxialFalloff, d.AxialFalloff);
                 mpb.SetFloat(IdHotspot, d.Hotspot);
@@ -163,12 +207,29 @@ namespace Origuma.StageBeam
                 if (d.GoboArray != null) mpb.SetTexture(IdGoboArray, d.GoboArray);
                 mpb.SetFloat(IdGoboSlice, d.GoboSlice);
                 mpb.SetFloat(IdGoboRot, d.GoboRotationRad);
+                mpb.SetVector(IdGoboOffset, d.GoboOffset);
 
                 if (d.GoboArray2 != null) mpb.SetTexture(IdGoboArray2, d.GoboArray2);
                 mpb.SetFloat(IdGoboSlice2, d.GoboSlice2);
                 mpb.SetFloat(IdGoboRot2, d.GoboRotationRad2);
 
-                StageBeamQueue.Add(d.Matrix, mpb);
+                // World-space bounding sphere for frustum / screen-area culling. The cone runs
+                // from the lens (local origin) down local -Y for Range, widening to EndRadius;
+                // the tightest enclosing sphere is centred at the mid-axis.
+                float half = d.Range * 0.5f;
+                var localCenter = new Vector3(0f, -half, 0f);
+                var worldCenter = d.Matrix.MultiplyPoint3x4(localCenter);
+                var ls = d.Matrix.lossyScale;
+                float maxScale = Mathf.Max(Mathf.Abs(ls.x), Mathf.Max(Mathf.Abs(ls.y), Mathf.Abs(ls.z)));
+                float worldRadius = Mathf.Sqrt(half * half + d.EndRadius * d.EndRadius) * maxScale;
+
+                // GPU-instanced path: also pack the same values as a GpuBeam record (gobo arrays
+                // carried alongside as the batch key). Cheap; only consumed when instancing is on.
+                GpuBeam raw = default;
+                if (GpuInstancing) raw = GpuBeam.Pack(in d, steps);
+
+                StageBeamQueue.Add(d.Matrix, mpb, d.ShadowLight, worldCenter, worldRadius,
+                    raw, GpuInstancing ? d.GoboArray : null, GpuInstancing ? d.GoboArray2 : null);
             }
         }
 
@@ -187,15 +248,35 @@ namespace Origuma.StageBeam
                 _builtSegments = Segments;
             }
             if (_mat == null)
-                _mat = Material != null ? Material : new Material(Shader.Find("Origuma/StageBeamCone"));
+            {
+                if (Material == null)
+                {
+                    // Auto-create and surface the instance in the Inspector's Material field so
+                    // an auto-spawned driver doesn't look broken ("Material: None").
+                    Material = new Material(Shader.Find("Origuma/StageBeamCone"))
+                        { name = "StageBeamCone (Runtime Instance)" };
+                    _ownsMat = true;
+                }
+                _mat = Material;
+            }
 
             if (_appliedBlend != Blend)
             {
-                // BlendMode enum values: One = 1, OneMinusDstColor = 6 (screen = soft additive).
-                _mat.SetFloat(IdSrcBlend, Blend == BeamBlend.SoftAdditive ? 6f : 1f);
+                // Both modes accumulate plain additive (One One). Soft Additive's saturation
+                // happens at COMPOSITE time: the renderer feature routes beams through an
+                // offscreen buffer and maps the TOTAL through K·(1−exp(−sum/K)) — identity
+                // for one thin beam, asymptotic to SoftMaxBrightness for a stack. Per-beam
+                // blend tricks can't do this: the ceiling has to see the summed value.
+                _mat.SetFloat(IdSrcBlend, 1f);
                 _mat.SetFloat(IdDstBlend, 1f);
+                _mat.SetFloat(IdBeamSoft, 0f);
                 _appliedBlend = Blend;
             }
+
+            // Published every frame (cheap statics) so the renderer feature routes/saturates
+            // accordingly even when these fields are animated.
+            StageBeamQueue.SoftComposite = Blend == BeamBlend.SoftAdditive;
+            StageBeamQueue.SoftCeiling = Mathf.Max(SoftMaxBrightness, 0.01f);
         }
 
         /// <summary>

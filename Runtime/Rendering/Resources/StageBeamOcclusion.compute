@@ -1,0 +1,153 @@
+// Fills a shared world-space occupancy volume that every beam samples for self-shadowing.
+// Occluders are supplied as ORIENTED BOXES (renderer local bounds x transform — walls, risers,
+// panels get their real silhouette) plus spheres (per-bone blobs for skinned meshes), so the
+// build cost is independent of the number of beams. One thread per voxel gathers over both lists.
+//
+// This is the "tight hull, zero-setup" tier. For concave/limb-accurate silhouettes the next
+// step up is a conservative-raster mesh voxelization pass writing the same RWTexture3D.
+
+#pragma kernel Clear
+#pragma kernel Splat
+#pragma kernel GrowMax
+#pragma kernel Dilate
+#pragma kernel TemporalBlend
+
+RWTexture3D<float> _Occ;           // R16F occupancy, 0 = clear, 1 = solid
+StructuredBuffer<float4> _Spheres; // xyz = centre (world), w = radius
+int    _SphereCount;
+StructuredBuffer<float4> _Boxes;   // 3 per box: [centre.xyz, softRef], [halfExt.xyz, 0], [rot quat]
+int    _BoxCount;
+
+float3 _VolMin;                    // world-space min corner
+float3 _VolSize;                   // world-space size
+uint3  _Res;                       // voxel resolution
+float  _EdgeSoftness;              // 0..1 fraction of the shape's reference size used as a soft shell
+
+[numthreads(4,4,4)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _Res)) return;
+    _Occ[id] = 0.0;
+}
+
+// Rotate v by the INVERSE of quaternion q (world -> box local; q is the box's world rotation).
+float3 QRotInv(float4 q, float3 v)
+{
+    float3 c = -q.xyz;
+    return v + 2.0 * cross(c, cross(c, v) + q.w * v);
+}
+
+[numthreads(4,4,4)]
+void Splat(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _Res)) return;
+
+    // World-space centre of this voxel.
+    float3 uvw   = (float3(id) + 0.5) / float3(_Res);
+    float3 voxWS = _VolMin + uvw * _VolSize;
+
+    float occ = 0.0;
+
+    for (int i = 0; i < _SphereCount; i++)
+    {
+        float4 s = _Spheres[i];
+        float  d = distance(voxWS, s.xyz);
+        float  r = max(s.w, 1e-4);
+        float  soft = max(_EdgeSoftness, 1e-3) * r;
+        // 1 well inside the sphere, smoothly to 0 across the soft shell at the surface.
+        float  cover = 1.0 - smoothstep(r - soft, r, d);
+        occ = max(occ, cover);
+        if (occ >= 0.999) break;
+    }
+
+    for (int b = 0; b < _BoxCount && occ < 0.999; b++)
+    {
+        float4 c  = _Boxes[b * 3 + 0];
+        float3 he = _Boxes[b * 3 + 1].xyz;
+        float4 q  = _Boxes[b * 3 + 2];
+
+        // Signed distance to the oriented box (world units; rotation is orthonormal because
+        // scale is folded into the half extents on the CPU).
+        float3 pl = QRotInv(q, voxWS - c.xyz);
+        float3 dq = abs(pl) - he;
+        float  d  = length(max(dq, 0.0)) + min(max(dq.x, max(dq.y, dq.z)), 0.0);
+
+        // Soft shell measured against the box's smallest half extent (c.w, floored on the CPU),
+        // fading occupancy in across the band just inside the surface.
+        float soft  = max(_EdgeSoftness, 1e-3) * c.w;
+        float cover = 1.0 - smoothstep(-soft, 0.0, d);
+        occ = max(occ, cover);
+    }
+
+    _Occ[id] = occ;
+}
+
+// Pure MAX dilation (ping-pong: reads _DilateSrc, writes _Occ). Grows the occupancy region
+// outward AND inward by one voxel at FULL strength. Mesh voxelization writes only the SURFACE
+// (triangles) — the body is a hollow shell — so a couple of these passes FILL the interior and
+// keep it solid at 1.0, which is what gives a strong shadow. Run BEFORE the blur: pure max
+// leaves no intermediate levels (everything grown is 1.0), so the following blur turns the
+// binary edge into a clean gradient with NO terracing.
+Texture3D<float> _DilateSrc;
+
+[numthreads(4,4,4)]
+void GrowMax(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _Res)) return;
+    int3 p = int3(id);
+    int3 hi = int3(_Res) - 1;
+    float m = _DilateSrc[id];
+    m = max(m, _DilateSrc[clamp(p + int3( 1, 0, 0), 0, hi)]);
+    m = max(m, _DilateSrc[clamp(p + int3(-1, 0, 0), 0, hi)]);
+    m = max(m, _DilateSrc[clamp(p + int3( 0, 1, 0), 0, hi)]);
+    m = max(m, _DilateSrc[clamp(p + int3( 0,-1, 0), 0, hi)]);
+    m = max(m, _DilateSrc[clamp(p + int3( 0, 0, 1), 0, hi)]);
+    m = max(m, _DilateSrc[clamp(p + int3( 0, 0,-1), 0, hi)]);
+    _Occ[id] = m;
+}
+
+// Center-weighted 7-tap smoothing BLUR (ping-pong: reads _DilateSrc, writes _Occ). Turns the
+// GrowMax-thickened binary occupancy's hard edge into a SMOOTH soft ramp the shadow march
+// can't step over.
+//
+// This must be a blur, not a max-dilation: `max(c, neighbor*0.7)` grows occupancy but leaves
+// DISCRETE concentric shells (1.0 → 0.7 → 0.49) around the occluder, and integrating those
+// along the shadow ray shows up as visibly TERRACED shadow edges (concentric rings). A blur
+// keeps the interior ~1 (a filled region blurs to itself) while feathering only the edge into
+// a continuous gradient — smooth, physically-plausible penumbra-like falloff.
+
+[numthreads(4,4,4)]
+void Dilate(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _Res)) return;
+
+    int3 p = int3(id);
+    int3 hi = int3(_Res) - 1;
+    float c = _DilateSrc[id];
+    float n = _DilateSrc[clamp(p + int3( 1, 0, 0), 0, hi)]
+            + _DilateSrc[clamp(p + int3(-1, 0, 0), 0, hi)]
+            + _DilateSrc[clamp(p + int3( 0, 1, 0), 0, hi)]
+            + _DilateSrc[clamp(p + int3( 0,-1, 0), 0, hi)]
+            + _DilateSrc[clamp(p + int3( 0, 0, 1), 0, hi)]
+            + _DilateSrc[clamp(p + int3( 0, 0,-1), 0, hi)];
+
+    // Interior (c=1, all neighbours 1) → 1. Edge feathers over ~2 voxels per iteration.
+    _Occ[id] = c * 0.4 + (n / 6.0) * 0.6;
+}
+
+// Temporal exponential moving average of the occupancy: history ← lerp(history, current, α).
+// The voxel grid is WORLD-ANCHORED (fixed in world space), so the same voxel maps to the same
+// world point across frames — no reprojection needed. This absorbs the frame-to-frame voxel
+// "popping" a moving occluder causes (its silhouette snaps between grid cells), so shadow
+// edges glide instead of chattering. Moving occluders' shadows lag a few frames (mild, reads
+// as smooth). _Current is this frame's freshly built volume; _Occ is the persistent history
+// that gets bound for shadowing.
+Texture3D<float> _Current;
+float _TemporalAlpha;   // fraction of THIS frame mixed in (1 = no smoothing)
+
+[numthreads(4,4,4)]
+void TemporalBlend(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _Res)) return;
+    _Occ[id] = lerp(_Occ[id], _Current[id], _TemporalAlpha);
+}

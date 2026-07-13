@@ -27,6 +27,11 @@ namespace Origuma.StageBeam
         public float BeamHalfAngleRad;
 
         public float Density;
+
+        /// <summary>Henyey-Greenstein scattering anisotropy g in [-0.9, 0.9]. 0 = isotropic;
+        /// 0.5–0.7 = forward scattering (beams aimed at the camera flare up like real haze).</summary>
+        public float Anisotropy;
+
         public float RaymarchSteps;
         /// <summary>1 = occlude against scene depth in the raymarch, 0 = off.</summary>
         public float DepthOcclude;
@@ -46,5 +51,15 @@ namespace Origuma.StageBeam
         public Texture2DArray GoboArray2;
         public float          GoboSlice2;
         public float          GoboRotationRad2;
+
+        /// <summary>UV offset of gobo wheel 1 (drives animation-wheel scroll effects). Applied
+        /// after the gobo's own rotation, before the cone edge masking.</summary>
+        public Vector2 GoboOffset;
+
+        /// <summary>The real (URP) Light co-located with this fixture, if any. With the
+        /// renderer feature's Shadows = LightShadowMap, the beam's raymarch samples this
+        /// light's URP shadow map — geometry-exact volumetric shadows. Null = beam renders
+        /// unshadowed in that mode.</summary>
+        public Light ShadowLight;
     }
 }

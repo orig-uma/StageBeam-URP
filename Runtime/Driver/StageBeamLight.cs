@@ -38,6 +38,15 @@ namespace Origuma.StageBeam
         [Tooltip("Overall brightness multiplier.")]
         public float Intensity = 1.2f;
 
+        [Tooltip("Real-fixture zoom behaviour: the same total light spread over the cone's " +
+                 "solid angle, so WIDENING Spot Angle dims the haze per unit volume (and a " +
+                 "tight beam gets hot) instead of the fog just growing. Intensity is exactly " +
+                 "×1 at Flux Reference Angle.")]
+        public bool ConserveFlux = true;
+
+        [Tooltip("Spot Angle at which Intensity applies unchanged when Conserve Flux is on.")]
+        [Range(1f, 120f)] public float FluxReferenceAngle = 30f;
+
         [Tooltip("Maximum throw distance in metres.")]
         public float Range = 15f;
 
@@ -58,6 +67,11 @@ namespace Origuma.StageBeam
         [Tooltip("Overall volume density.")]
         [Range(0f, 4f)] public float Density = 1f;
 
+        [Tooltip("Scattering anisotropy (Henyey-Greenstein g). 0 = uniform brightness from " +
+                 "every viewing angle. 0.5-0.7 = forward scattering: beams pointing at the " +
+                 "camera flare up, the way real haze reads under stage lighting.")]
+        [Range(-0.9f, 0.9f)] public float Anisotropy;
+
         [Tooltip("How strongly the beam fades along its length (0 = no fade, 2 = fades fast).")]
         [Range(0f, 2f)] public float AxialFalloff = 1f;
 
@@ -77,6 +91,12 @@ namespace Origuma.StageBeam
         [Tooltip("Raymarch sample count. Higher = smoother gradients, more cost.")]
         [Range(1, 128)] public int RaymarchSteps = 24;
 
+        [Tooltip("Real spot Light co-located with this fixture (shadows enabled). With the " +
+                 "renderer feature's Shadows = LightShadowMap, the beam samples ITS shadow " +
+                 "map — geometry-exact volumetric shadows. Empty = a shadowed spot Light on " +
+                 "this GameObject or its children is used automatically if one exists.")]
+        public Light ShadowLight;
+
         [Tooltip("Clip the beam against scene depth (so it stops at walls/floors) instead of " +
                  "passing through solid geometry.")]
         public bool DepthOcclude = true;
@@ -90,6 +110,10 @@ namespace Origuma.StageBeam
 
         [Tooltip("Continuous gobo spin speed, in degrees per second. 0 = static.")]
         public float GoboRotationSpeedDegPerSec;
+
+        [Tooltip("Continuous gobo UV scroll speed, in UV units per second (animation-wheel " +
+                 "effect: scrolls the gobo pattern across the aperture). Zero = no scroll.")]
+        public Vector2 GoboScrollSpeedUVPerSec;
 
         /// <summary>Beam colour (scripting access).</summary>
         public Color BeamColor { get => Color; set => Color = value; }
@@ -109,6 +133,7 @@ namespace Origuma.StageBeam
 
         private StageBeamDriver _driver;
         private float _goboRotationRuntimeDeg;
+        private Vector2 _goboOffsetRuntime;
 
         private void OnEnable()
         {
@@ -125,6 +150,8 @@ namespace Origuma.StageBeam
         {
             if (GoboRotationSpeedDegPerSec != 0f)
                 _goboRotationRuntimeDeg += GoboRotationSpeedDegPerSec * Time.deltaTime;
+            if (GoboScrollSpeedUVPerSec != Vector2.zero)
+                _goboOffsetRuntime += GoboScrollSpeedUVPerSec * Time.deltaTime;
         }
 
         /// <inheritdoc />
@@ -135,13 +162,27 @@ namespace Origuma.StageBeam
             var beamHalfRad = beamAngleClamped * 0.5f * Mathf.Deg2Rad;
             var endRadius = Range * Mathf.Tan(fieldHalfRad) + StartRadius;
 
+            // Flux conservation: Ω(ref)/Ω(actual), clamped like the MVR path — wide cones
+            // dim per unit volume instead of the fog simply growing brighter in total.
+            float zoomFlux = 1f;
+            if (ConserveFlux)
+            {
+                float refOmega = 1f - Mathf.Cos(FluxReferenceAngle * 0.5f * Mathf.Deg2Rad);
+                float actOmega = 1f - Mathf.Cos(fieldHalfRad);
+                if (refOmega > 1e-7f && actOmega > 1e-7f)
+                    zoomFlux = Mathf.Clamp(refOmega / actOmega, 0.02f, 8f);
+            }
+
             ResolveGobo(out var goboArray, out var goboSlice);
+
+            if (ShadowLight == null) ShadowLight = GetComponentInChildren<Light>();
 
             beams.Add(new StageBeamInstance
             {
                 Matrix = BuildMatrix(),
                 Color = Color,
-                Intensity = Intensity,
+                Intensity = Intensity * zoomFlux,
+                ShadowLight = ShadowLight,
                 StartRadius = StartRadius,
                 EndRadius = endRadius,
                 Range = Range,
@@ -149,6 +190,7 @@ namespace Origuma.StageBeam
                 FieldHalfAngleRad = fieldHalfRad,
                 BeamHalfAngleRad = beamHalfRad,
                 Density = Density,
+                Anisotropy = Anisotropy,
                 RaymarchSteps = RaymarchSteps,
                 DepthOcclude = DepthOcclude ? 1f : 0f,
                 AxialFalloff = AxialFalloff,
@@ -161,7 +203,8 @@ namespace Origuma.StageBeam
                 GoboRotationRad = (GoboRotationDeg + _goboRotationRuntimeDeg) * Mathf.Deg2Rad,
                 GoboArray2 = null,
                 GoboSlice2 = -1f,
-                GoboRotationRad2 = 0f
+                GoboRotationRad2 = 0f,
+                GoboOffset = _goboOffsetRuntime
             });
         }
 
@@ -199,7 +242,9 @@ namespace Origuma.StageBeam
                     Gobo.width, Gobo.height, 1, Gobo.format, Gobo.mipmapCount > 1)
                 {
                     name = $"StageBeamGobo_{Gobo.name}",
-                    wrapMode = Gobo.wrapMode,
+                    // Always Clamp: the beam shader relies on it (scrolling tiles explicitly
+                    // via frac), so a source texture imported as Repeat must not leak through.
+                    wrapMode = TextureWrapMode.Clamp,
                     filterMode = Gobo.filterMode
                 };
                 Graphics.CopyTexture(Gobo, 0, texArray, 0);

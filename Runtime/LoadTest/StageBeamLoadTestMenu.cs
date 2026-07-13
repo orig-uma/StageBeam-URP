@@ -10,7 +10,7 @@ namespace Origuma.StageBeam
     /// </summary>
     internal static class StageBeamLoadTestMenu
     {
-        [MenuItem("Tools/Origuma StageLight/Create Stage Beam Load Test")]
+        [MenuItem("Tools/Origuma/Stage Beam Load Test")]
         private static void Create()
         {
             var go = new GameObject("StageBeam LoadTest");
@@ -27,22 +27,15 @@ namespace Origuma.StageBeam
                 Undo.RegisterCreatedObjectUndo(camGo, "Create Camera");
             }
 
-            // Also drop a volumetric-shadow setup so the load test can exercise shadows at scale.
+            // Volumetric shadows need no scene object: set Shadows = Volume on the renderer
+            // feature and occlusion is built automatically from the spawned occluders.
             test.SpawnOccluders = true;
-            var vol = new GameObject("Stage Beam Occlusion Volume").AddComponent<StageBeamOcclusionVolume>();
-            vol.Size = new Vector3(24f, 16f, 24f);
-            vol.OccluderMask = ~0;
-            Undo.RegisterCreatedObjectUndo(vol.gameObject, "Create Occlusion Volume");
-
-            var computeGuid = AssetDatabase.FindAssets("StageBeamOcclusion t:ComputeShader");
-            if (computeGuid.Length > 0)
-                vol.Occlusion = AssetDatabase.LoadAssetAtPath<ComputeShader>(
-                    AssetDatabase.GUIDToAssetPath(computeGuid[0]));
 
             Selection.activeGameObject = go;
-            Debug.Log("[StageBeam] Load test + occlusion volume created. On the active URP Renderer's " +
-                      "StageBeamRendererFeature set Shadows = Volume, then press Play. The spawned " +
-                      "occluder spheres cast volumetric shadows; toggle 'Half Resolution' to compare GPU time.");
+            Debug.Log("[StageBeam] Load test created. On the active URP Renderer's " +
+                      "StageBeamRendererFeature set Shadows = Volume, then press Play — occlusion " +
+                      "is automatic (the spawned occluder spheres cast volumetric shadows). " +
+                      "Toggle 'Half Resolution' to compare GPU time.");
         }
     }
 }

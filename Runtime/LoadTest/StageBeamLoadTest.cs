@@ -12,7 +12,7 @@ namespace Origuma.StageBeam
     /// Add to any GameObject in a scene that has a camera and a URP renderer with the
     /// StageBeamRendererFeature enabled. Tweak <see cref="BeamCount"/> at runtime.
     /// </summary>
-    [AddComponentMenu("MVR/Stage Beam Load Test")]
+    [AddComponentMenu("Stage Beam/Stage Beam Load Test")]
     public sealed class StageBeamLoadTest : MonoBehaviour
     {
         [Header("Load")]
