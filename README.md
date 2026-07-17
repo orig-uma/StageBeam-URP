@@ -26,10 +26,10 @@ Renderer Feature を1つ足して `Stage Beam Light` を置くだけで動きま
 * **Soft Additive（白飛び対策）:** オフスクリーンに合計を蓄積して天井カーブに通すので、多灯が重なっても
   白飛び・ブルーム潰れ・ACES 変色が起きません。変調保存により飽和域でも影の削れ・ヘイズの流れが残ります。
   （→ [PERFORMANCE](Documentation~/PERFORMANCE.md)）
-* **運用向けの負荷レバー:** 解像度スケール（Full/Half/Quarter・深度考慮アップサンプル）、境界球カリング、
-  シャドウ/ヘイズ間引き、ズーム適応ステップ、占有ビルドの更新間隔、静的/動的オクルーダー分離、任意の
-  GPU インスタンシング。実測で 200 灯（原点集中の最悪ケース）+ 5 ダンサーが RTX 5060 Ti / FullHD で
-  ~80FPS。
+* **運用向けの負荷レバー:** 解像度スケール（Full/Half/Third/Quarter・深度考慮アップサンプル）、境界球
+  カリング、シャドウ/ヘイズ間引き、ズーム適応ステップ、占有ビルドの更新間隔、静的/動的オクルーダー分離、
+  任意の GPU インスタンシング。フィルレート律速なので、負荷は灯数よりも**画面被覆とビューポート解像度**で
+  決まります。
 * **ゴボ・床プール:** 1〜2 枚のゴボ投影（回転・アニメホイールスクロール独立）と、床への光プール
   （デカール投影、Receiver Layer マスク付き）。
 * **ドロップイン & プログラマブル:** `Stage Beam Light` を置くだけの手置き運用と、`IStageBeamSource` を
@@ -72,7 +72,8 @@ https://github.com/orig-uma/StageBeam-URP.git#v0.1.0
 | Static/Dynamic Split | 動かない剛体オクルーダーをキャッシュ、動くもの（スキン/移動）だけ毎ビルド再構築。自動判定（レイヤー不要）。ゆるいマスクでもビルドスパイクを抑制。opt-in |
 | Soft Additive | オフスクリーン蓄積＋天井カーブで多灯重なりの白飛び/ブルーム潰れ/ACES 変色を防止。変調保存で影・ヘイズを維持。床プールも同処理 |
 | Gobo | 最大 2 枚のゴボ投影（Texture2DArray、回転・アニメホイールスクロール独立） |
-| Resolution Scale | Full / Half / Quarter。深度考慮（joint bilateral）アップサンプル。フィルレート最大の負荷レバー |
+| Resolution Scale | Full / Half / Third / Quarter（ピクセル 1/1・1/4・1/9・1/16）。深度考慮（joint bilateral）アップサンプル。フィルレート最大の負荷レバー |
+| Anti-banding | 合成時（カメラの低仮数 HDR 形式に書く瞬間）の値相対ディザ。ビームの緩いランプが拾うマッハバンドを除去 |
 | Haze Noise | 3D ノイズによるヘイズの揺らぎ（同梱・自動ロード）。流速一致ジッターで低解像度のグレインを緩和 |
 | Surface Projection | 床のライトプール（ゴボ×色をデカール投影）。Receiver Layer マスク、Shadow Hardness で遮蔽感を調整 |
 | Culling | 境界球による視錐台カリング＋画面投影半径カリング（遠く/画面外/極小を棄却） |

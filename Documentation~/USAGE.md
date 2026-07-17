@@ -177,13 +177,21 @@ The two things that drive cost are **overlap** (how many beams stack on a pixel)
 coverage** (how many pixels each beam paints) — cost ≈ covered pixels × overlap × steps. The
 levers below attack those.
 
-- **Resolution Scale** (Renderer Feature, **default Quarter**): **Full / Half / Quarter**. Half
-  raymarches beams into a 1/4-pixel-count off-screen target, Quarter into 1/16, then composites
-  with a depth-aware (joint bilateral) upsample so object silhouettes stay clean instead of
-  stair-stepping. This is the **biggest fill-rate lever when beams cover the screen**, and the
-  core look/perf tradeoff: lower = far cheaper, higher = crisper beam edges. Quarter is the
-  default as a good balance; move to Half/Full if you want sharper beams and can spend the fill
-  rate. (The old *Half Resolution* checkbox migrates to this enum automatically.)
+- **Resolution Scale** (Renderer Feature, **default Quarter**): **Full / Half / Third / Quarter** —
+  raymarch pixel counts of 1/1, 1/4, **1/9** and 1/16 — composited with a depth-aware (joint
+  bilateral) upsample so object silhouettes stay clean instead of stair-stepping. This is the
+  **biggest fill-rate lever when beams cover the screen**, and the core look/perf tradeoff: lower =
+  far cheaper, higher = crisper beam edges. Quarter is the default as a good balance.
+  **Third** exists for the middle ground: the depth-aware upsample only rescues *object*
+  silhouettes (depth discontinuities) — a beam's own soft edge has no depth step, so it is simply
+  magnified, and gets visibly coarse as resolution drops. At high output resolutions Quarter can
+  read as too coarse while Half costs 4× more pixels; Third splits that. (The old *Half Resolution*
+  checkbox migrates to this enum automatically.)
+- **Dither** (Renderer Feature, **default 0.15**): anti-banding applied where the beam is
+  composited into the camera target. Beams are wide, smooth, low-slope ramps — exactly the signal
+  that shows Mach banding once written to the camera's low-mantissa HDR format (B10G11R11, i.e.
+  32-bit HDR precision). Raise until the contours break up, lower if it reads as grain; 0 = off.
+  On 64-bit HDR precision there is nothing to fix and this can stay at 0.
 - **Temporal Jitter** (on by default): the raymarch jitter scrolls each frame *at the haze's
   flow speed*, so the grain drifts with the fog rather than sitting as screen-fixed dirt. This
   softens the low-step/low-res grain without TAA. If the camera has **Temporal Anti-aliasing**
