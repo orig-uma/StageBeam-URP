@@ -30,9 +30,9 @@ Shader "Origuma/StageBeamCone"
         _GoboSlice2   ("Gobo Slice 2 (-1=off)", Float) = -1
         _GoboRotation2("Gobo Rotation 2 (rad)", Float) = 0
         [NoScaleOffset] _GoboArray2 ("Gobo Array 2", 2DArray) = "white" {}
-        // Anti-banding: value-relative dither hides the quantization contours the
-        // smooth gradient picks up when stored in a low-mantissa target (R11G11B10).
-        _Dither      ("Dither (anti-banding)", Range(0, 0.1)) = 0.02
+        // (Anti-banding dither lives on the Renderer Feature, not here: this shader writes into an
+        // ARGBHalf buffer with mantissa to spare. The banding is born at the COMPOSITE, where the
+        // result is blended into the camera's low-mantissa target — see StageBeamUpsample.)
         // Blend factors: Additive = One One, Soft Additive (screen) = OneMinusDstColor One.
         [HideInInspector] _BeamSrcBlend ("Src Blend", Float) = 1
         [HideInInspector] _BeamDstBlend ("Dst Blend", Float) = 1
@@ -88,7 +88,6 @@ Shader "Origuma/StageBeamCone"
                 float4 _GoboOffset;
                 float  _GoboSlice2;
                 float  _GoboRotation2;
-                float  _Dither;
             CBUFFER_END
 
             struct Attributes { float3 positionOS : POSITION; };
@@ -109,7 +108,12 @@ Shader "Origuma/StageBeamCone"
                 // clipping its soft edge to the cone's polygon facets — visible "segments".)
                 float rEndBeam = _Range * max(tan(_FieldHalf), 1e-3) + _StartRadius;
                 float r = lerp(_StartRadius, rEndBeam, saturate(t)) * 1.2;
-                float3 posOS = float3(v.positionOS.x * r, -t * _Range, v.positionOS.z * r);
+                // Clamp the axial position so cap vertices behind the apex (t<0 — the lens-cap
+                // centre sits at y=-0.2) don't poke a thin hull out the BACK of the lens. Those
+                // fragments still integrate the forward beam along the view ray, so they'd show
+                // as a faint cone pointing OPPOSITE the beam. Forward margin (t>1, the reach cap)
+                // is kept — it correctly encloses the far end. Mirrors the saturate(t) on r.
+                float3 posOS = float3(v.positionOS.x * r, -max(t, 0.0) * _Range, v.positionOS.z * r);
                 o.positionWS = TransformObjectToWorld(posOS);
                 o.positionHCS = TransformWorldToHClip(o.positionWS);
                 return o;
@@ -225,7 +229,6 @@ Shader "Origuma/StageBeamCone"
                 float4 _GoboOffset;
                 float  _GoboSlice2;
                 float  _GoboRotation2;
-                float  _Dither;
             CBUFFER_END
 
             float _BeamSoft;
@@ -268,7 +271,9 @@ Shader "Origuma/StageBeamCone"
                 // Same field-angle hull sizing as the uniform pass.
                 float rEndBeam = range * max(tan(fieldHalf), 1e-3) + startRadius;
                 float r = lerp(startRadius, rEndBeam, saturate(t)) * 1.2;
-                float3 posOS = float3(v.positionOS.x * r, -t * range, v.positionOS.z * r);
+                // See the uniform pass: clamp behind-apex cap vertices so no phantom hull sticks
+                // out the back of the lens (would show a faint cone opposite the beam).
+                float3 posOS = float3(v.positionOS.x * r, -max(t, 0.0) * range, v.positionOS.z * r);
 
                 o.positionWS  = StageBeamObjectToWorld(b, posOS);
                 o.positionHCS = TransformWorldToHClip(o.positionWS);
