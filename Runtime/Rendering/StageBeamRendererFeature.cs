@@ -55,15 +55,24 @@ namespace Origuma.StageBeam
     {
         [SerializeField] private RenderPassEvent _event = RenderPassEvent.AfterRenderingTransparents;
 
-        [Tooltip("Render beams into a downscaled target and upsample. Half = 1/4 the raymarch " +
-                 "pixels, Quarter = 1/16 — the biggest fill-rate lever when beams cover the " +
-                 "screen. Beams soften slightly (depth-aware upsample keeps object edges clean).")]
+        [Tooltip("Render beams into a downscaled target and upsample — the biggest fill-rate lever " +
+                 "when beams cover the screen. Raymarch pixels: Half = 1/4, Third = 1/9, " +
+                 "Quarter = 1/16. Third sits between Half and Quarter: reach for it when Quarter " +
+                 "bands/moires at high output resolutions but Half costs too much. Beams soften " +
+                 "slightly (depth-aware upsample keeps object edges clean).")]
         [SerializeField] private ResolutionScale _resolutionScale = ResolutionScale.Quarter;
 
         [Tooltip("Depth-aware smoothing of the beam buffer before compositing. Averages away " +
                  "the raymarch/shadow jitter grain — most visible in shadowed regions at Half/" +
                  "Quarter resolution — at the cost of a slightly softer fog. Near-free.")]
         [SerializeField] private bool _noiseSmoothing = true;
+
+        [Tooltip("Anti-banding dither applied when the beam is composited into the camera target, " +
+                 "as a fraction of each pixel's value. Beams are wide, smooth, low-slope ramps — " +
+                 "exactly what quantizes into Mach bands in the camera's low-mantissa HDR format " +
+                 "(B10G11R11, 32-bit HDR). Raise until the contours break up; lower if it reads as " +
+                 "grain. 0 = off (and free — the branch is skipped).")]
+        [Range(0f, 0.5f)] [SerializeField] private float _dither = 0.15f;
 
         [Tooltip("On: the raymarch dither DRIFTS with the haze (screen-space, matched to the " +
                  "haze scroll) so the grain reads as the fog moving rather than a separate " +
@@ -81,7 +90,10 @@ namespace Origuma.StageBeam
                  "contribution isn't visible anyway.")]
         [Range(0f, 32f)] [SerializeField] private float _minScreenRadiusPx = 0f;
 
-        public enum ResolutionScale { Full, Half, Quarter }
+        // Ordered coarsest-to-finest as it reads in the dropdown. NOTE: these serialize by index,
+        // so this ordering is not append-safe — any asset previously saved as Quarter (2) now loads
+        // as Third. Re-check the Resolution Scale on existing Renderer Feature assets.
+        public enum ResolutionScale { Full, Half, Third, Quarter }
 
         // Back-compat: the old bool field is migrated to the enum on first load (see OnEnable).
         [SerializeField, HideInInspector] private bool _halfResolution = false;
@@ -203,6 +215,7 @@ namespace Origuma.StageBeam
         private static readonly int IdBeamRTParams      = Shader.PropertyToID("_BeamRTParams");
         private static readonly int IdUpsampleTexelSize = Shader.PropertyToID("_BeamUpsampleTexelSize");
         private static readonly int IdBeamSoftCeiling   = Shader.PropertyToID("_BeamSoftCeiling");
+        private static readonly int IdBeamDither        = Shader.PropertyToID("_BeamDither");
         private static readonly int IdTemporalJitter    = Shader.PropertyToID("_BeamTemporalJitter");
         private static readonly int IdJitterScroll      = Shader.PropertyToID("_BeamJitterScroll");
         private static readonly int IdHazeNoise         = Shader.PropertyToID("_HazeNoise");
@@ -232,6 +245,7 @@ namespace Origuma.StageBeam
         private int ResolutionDivisor => _resolutionScale switch
         {
             ResolutionScale.Half => 2,
+            ResolutionScale.Third => 3,
             ResolutionScale.Quarter => 4,
             _ => 1,
         };
@@ -480,6 +494,7 @@ namespace Origuma.StageBeam
 
             _pass.ResolutionDivisor   = _upsampleMat != null ? ResolutionDivisor : 1;
             _pass.NoiseSmoothing      = _noiseSmoothing;
+            _pass.Dither              = _dither;
             _pass.UpsampleMat         = _upsampleMat;
             _pass.ProjectOntoSurfaces = _projectOntoSurfaces && _projectionMat != null;
             _pass.ProjectionMat       = _projectionMat;
@@ -529,7 +544,8 @@ namespace Origuma.StageBeam
 
         private sealed class StageBeamPass : ScriptableRenderPass
         {
-            public int       ResolutionDivisor = 1;   // 1 = full, 2 = half, 4 = quarter
+            public float     Dither = 0.02f;          // anti-banding at the composite write
+            public int       ResolutionDivisor = 1;   // 1 = full, 2 = half, 3 = third, 4 = quarter
             public bool      NoiseSmoothing = true;
             public bool      AllowInstancing = true;   // false in LightShadowMap mode (see feature)
             public Material  UpsampleMat;
@@ -580,6 +596,7 @@ namespace Origuma.StageBeam
                 public Material Mat;
                 public int W, H;
                 public float SoftCeiling;
+                public float Dither;
             }
             private class ProjData
             {
@@ -680,6 +697,7 @@ namespace Origuma.StageBeam
                 cdata.Mat    = UpsampleMat;
                 cdata.W = decalDesc.width; cdata.H = decalDesc.height;
                 cdata.SoftCeiling = StageBeamQueue.SoftCeiling;
+                cdata.Dither = Dither;
                 cb.UseTexture(decalRT);
                 cb.UseAllGlobalTextures(true);
                 if (resources.cameraDepthTexture.IsValid())
@@ -692,6 +710,7 @@ namespace Origuma.StageBeam
                     ctx.cmd.SetGlobalVector(IdUpsampleTexelSize,
                         new Vector4(1f / d.W, 1f / d.H, d.W, d.H));
                     ctx.cmd.SetGlobalFloat(IdBeamSoftCeiling, d.SoftCeiling);
+                    ctx.cmd.SetGlobalFloat(IdBeamDither, d.Dither);
                     Blitter.BlitTexture(ctx.cmd, d.Source, new Vector4(1f, 1f, 0f, 0f), d.Mat, 0);
                 });
             }
@@ -924,6 +943,7 @@ namespace Origuma.StageBeam
                     data.Mat    = UpsampleMat;
                     data.W = offW; data.H = offH;
                     data.SoftCeiling = StageBeamQueue.SoftComposite ? StageBeamQueue.SoftCeiling : 0f;
+                    data.Dither = Dither;
                     builder.UseTexture(compositeSource);
                     builder.UseAllGlobalTextures(true);
                     if (resources.cameraDepthTexture.IsValid())
@@ -936,6 +956,7 @@ namespace Origuma.StageBeam
                         ctx.cmd.SetGlobalVector(IdUpsampleTexelSize,
                             new Vector4(1f / d.W, 1f / d.H, d.W, d.H));
                         ctx.cmd.SetGlobalFloat(IdBeamSoftCeiling, d.SoftCeiling);
+                        ctx.cmd.SetGlobalFloat(IdBeamDither, d.Dither);
                         Blitter.BlitTexture(ctx.cmd, d.Source, new Vector4(1f, 1f, 0f, 0f), d.Mat, 0);
                     });
                 }

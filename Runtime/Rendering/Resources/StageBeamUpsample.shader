@@ -28,6 +28,16 @@ Shader "Origuma/StageBeamUpsample"
             // white. 0 = off (plain additive composite).
             float _BeamSoftCeiling;
 
+            // Anti-banding dither amplitude, as a FRACTION OF THE PIXEL'S VALUE. 0 = off.
+            float _BeamDither;
+
+            // Interleaved gradient noise — a low-discrepancy per-pixel value, matched to what the
+            // cone's raymarch jitter uses.
+            float BeamIGN(float2 p)
+            {
+                return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+            }
+
             // Depth-aware (joint bilateral) upsample. A plain tent filter smooths the half-res
             // blocks but ignores depth, so at object silhouettes the beam's depth-clipped edge
             // stays a jagged half-res staircase and bleeds onto foreground geometry. Weighting
@@ -100,6 +110,21 @@ Shader "Origuma/StageBeamUpsample"
                     float m = clamp(lum / max(outc.a, 1e-5), 0.03, 4.0);
                     float3 baseCol = outc.rgb / m;
                     outc.rgb = _BeamSoftCeiling * (1.0 - exp(-baseCol / _BeamSoftCeiling)) * m;
+                }
+
+                // Anti-banding, applied HERE because this is where the precision is lost: the beam
+                // accumulates in ARGBHalf (plenty of mantissa) but this pass blends additively into
+                // the CAMERA target, which is typically B10G11R11 — 6-bit mantissa on R/G, 5 on B.
+                // A beam is a wide, smooth, low-slope ramp, which is exactly the signal that
+                // quantizes into Mach-banded contours at that precision.
+                // The step of a float format is PROPORTIONAL to the value, so the dither must be
+                // too — a fixed offset would be invisible in the highlights and overwhelming in the
+                // dark. ±0.5·_BeamDither of the pixel's own value ≈ ±half an LSB at the default,
+                // which breaks the contour into noise the eye integrates away.
+                if (_BeamDither > 0.0)
+                {
+                    float d = BeamIGN(input.positionCS.xy) - 0.5;
+                    outc.rgb *= 1.0 + d * _BeamDither;
                 }
                 return outc;
             }
