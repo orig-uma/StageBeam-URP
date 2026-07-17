@@ -178,6 +178,7 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
     bool  goboScrolls = abs(p.goboOffset.x) + abs(p.goboOffset.y) > 1e-5;
     float cs  = cos(p.goboRot),  sn  = sin(p.goboRot);
     float cs2 = cos(p.goboRot2), sn2 = sin(p.goboRot2);
+    float goboSlope = (radiusEnd - radiusStart) / max(p.range, 1e-5);   // dWidth/dz, for the gobo mip
     float sideSoftness = max(p.edgeSoftness, 0.01);
     float tanBeam = max(tan(p.beamHalf), 1e-4);
     float rootLen = max(p.rootBoostFrac * p.range, 1e-3);
@@ -235,17 +236,40 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
         if (useGobo || useGobo2)
         {
             float2 g = p3.xy / max(widthAtZ, 1e-5);     // [-1,1] across the field
+
+            // --- Gobo mip footprint (prefilter, not more samples) -------------------------
+            // A gobo carves the volume into thin light shafts. The hardware's automatic mip only
+            // sees how the UV changes ACROSS THE SCREEN; it cannot see that the march also jumps
+            // `stepSize` ALONG the ray between samples. Shafts finer than that jump get stepped
+            // straight over — one pixel lands in a shaft, its neighbour misses — and that variance
+            // is the dappling/moire. So widen the filter to whichever footprint is coarser:
+            // the shaft is then blurred BELOW the sampling rate instead of aliasing against it.
+            //
+            // g = p3.xy / w(z), so  dg/dt = (rayCL.xy - g * dw/dz * rayCL.z) / w   (quotient rule).
+            // Gradients come from g, NOT the frac()'d UV: frac's wrap discontinuity would spike the
+            // derivative and slam the sampler to the coarsest mip in a line along the seam.
+            float2 dgdt    = (rayCL.xy - g * (goboSlope * rayCL.z)) / max(widthAtZ, 1e-5);
+            float  rayFoot = length(dgdt) * stepSize * 0.5;                 // 0.5: guv = g*0.5+0.5
+            float  scrFoot = max(length(ddx(g)), length(ddy(g))) * 0.5;
+            float  foot    = max(rayFoot, scrFoot);
+            // Isotropic on purpose — we want the shafts filtered, not anisotropically preserved.
+            float2 footX = float2(foot, 0.0);
+            float2 footY = float2(0.0, foot);
+            // Rotation is rigid, so both wheels share this footprint.
+
             if (useGobo)
             {
                 float2 guv = float2(g.x * cs - g.y * sn, g.x * sn + g.y * cs) * 0.5 + 0.5;
                 if (goboScrolls) guv = frac(guv + p.goboOffset.xy);
-                half4 g1 = SAMPLE_TEXTURE2D_ARRAY(_GoboArray, sampler_GoboArray, guv, p.goboSlice);
+                half4 g1 = SAMPLE_TEXTURE2D_ARRAY_GRAD(_GoboArray, sampler_GoboArray, guv,
+                                                       p.goboSlice, footX, footY);
                 gobo *= g1.r * g1.a;
             }
             if (useGobo2)
             {
                 float2 guv2 = float2(g.x * cs2 - g.y * sn2, g.x * sn2 + g.y * cs2) * 0.5 + 0.5;
-                half4 g2 = SAMPLE_TEXTURE2D_ARRAY(_GoboArray2, sampler_GoboArray2, guv2, p.goboSlice2);
+                half4 g2 = SAMPLE_TEXTURE2D_ARRAY_GRAD(_GoboArray2, sampler_GoboArray2, guv2,
+                                                       p.goboSlice2, footX, footY);
                 gobo *= g2.r * g2.a;
             }
         }
