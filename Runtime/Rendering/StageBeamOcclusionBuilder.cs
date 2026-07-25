@@ -127,8 +127,23 @@ namespace Origuma.StageBeam
         /// <summary>Occluders taken out of the raster set because a hint represents them.</summary>
         public int HintCoveredOccluders => _statHintCovered;
 
+        /// <summary>
+        /// True when the last build could not compare against previous matrices (first build of
+        /// this builder instance, or the occluder list outgrew the cache). Discriminates two
+        /// look-alike situations behind an "everything is dynamic, static rebuilt every time"
+        /// report: TRUE on every sample means the cache is being wiped between builds (builder
+        /// recreated, or a rescan resizing arrays) — a fixable accounting bug. FALSE means the
+        /// occluders genuinely moved — the classification is right and the cost is real, so the
+        /// levers are instancing / fewer axes, not cache repair.
+        /// </summary>
+        public bool LastMatrixCacheReset => _statMatrixReset;
+        /// <summary>Time.frameCount of the last recorded build (staleness check for the report).</summary>
+        public int LastBuildFrame => _statBuildFrame;
+
         private int _statDraws, _statOccluders, _statDynamic;
         private int _statHints, _statHintCovered;
+        private int _statBuildFrame = -1;
+        private bool _statMatrixReset;
         private bool _statRebuiltStatic;
         private bool _warnedSphereOverflow;
         public Vector4 GetSphere(int i) => _spheres != null && i < _spheres.Length ? _spheres[i] : default;
@@ -250,6 +265,7 @@ namespace Origuma.StageBeam
             if (_volume == null || _spheres == null) return;
             _statDraws = 0;
             _statRebuiltStatic = false;
+            _statBuildFrame = Time.frameCount;
             RecordUploadAndDispatch(cmd);
             if (MeshVoxelize)
             {
@@ -865,11 +881,13 @@ namespace Origuma.StageBeam
                 }
                 matricesReset = _lastMatrices == null || _lastMatrices.Length < n;
                 if (matricesReset) _lastMatrices = new Matrix4x4[Mathf.Max(n, 8)];
+                _statMatrixReset = matricesReset;
             }
 
             _staticDirty = false;
             _statOccluders = 0;
             _statDynamic = 0;
+            _statMatrixReset = false;
             for (var i = 0; i < n; i++)
             {
                 var r = _occluders[i];
