@@ -374,10 +374,19 @@ namespace Origuma.StageBeam
             // frame (it resets on Play enter while this feature instance — and its
             // _occlusionBuiltFrame — persist across sessions): a negative elapsed must NOT be
             // read as "within the interval" or the volume would never rebuild.
+            // Interval throttling keys off Time.frameCount, which FREEZES while the game is paused —
+            // and pausing is exactly what the Frame Debugger does to capture a frame. Left as a bare
+            // frame-count compare, `elapsed` stays 0 on every repaint after the pause, the build is
+            // skipped forever, and the consequences look like two unrelated bugs: the occlusion work
+            // is absent from the captured frame (so it can never be inspected — the very thing one
+            // opens the Frame Debugger for), and the shadow globals stop being published, so beams
+            // render unshadowed and blown out. Detect the frozen counter and build anyway.
             if (Application.isPlaying)
             {
                 int elapsed = Time.frameCount - _occlusionBuiltFrame;
-                if (elapsed >= 0 && elapsed < Mathf.Max(1, _volUpdateInterval)) return null;
+                bool timeFrozen = elapsed == 0;   // repaint without the frame counter advancing
+                if (!timeFrozen && elapsed > 0 && elapsed < Mathf.Max(1, _volUpdateInterval))
+                    return null;
                 _occlusionBuiltFrame = Time.frameCount;
             }
 
@@ -434,10 +443,14 @@ namespace Origuma.StageBeam
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
         {
             ApplyShadowMode();
-            // Build the occupancy volume here (RenderGraph RECORDING phase) via an immediate
-            // command buffer — the same point the working auto path always used. Doing it as a
-            // RenderGraph pass aliased the voxelize temp RT with the beam offscreen buffer and
-            // corrupted the image, so the build stays outside the graph's texture machinery.
+            // KNOWN LIMITATION: this executes via Graphics.ExecuteCommandBuffer, which bypasses the
+            // SRP render loop — so the Frame Debugger has nowhere to attribute the build's hundreds
+            // of SetPass calls, and anyone investigating a high SetPass count finds nothing that
+            // explains them. Its home is a RenderGraph pass; two attempts at moving it there failed
+            // (the first aliased the voxelize temp RT onto the beam buffer and corrupted the image,
+            // the second rendered correctly only while paused and washed out during play) and both
+            // were reverted rather than left half-working. Use
+            // Window > Origuma > Stage Beam > Log Occlusion Build Cost to read the cost meanwhile.
             PrepareOcclusion()?.BuildAndBind();
             Shader.SetGlobalFloat(IdMasterIntensity, _masterIntensity);
             Shader.SetGlobalFloat(IdTemporalJitter, _temporalJitter ? 1f : 0f);
