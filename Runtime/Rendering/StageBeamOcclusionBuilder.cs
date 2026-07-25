@@ -6,10 +6,14 @@ namespace Origuma.StageBeam
 {
     /// <summary>
     /// Builds the single shared world-space occupancy volume every StageBeam cone self-shadows
-    /// against: occluders are discovered by layer mask, approximated as oriented boxes from
-    /// their renderer's local bounds (per-bone spheres for skinned meshes, so dancers read as
-    /// limbs), voxelized by a compute shader once per frame, and bound as global shader state.
-    /// Cost is independent of how many beams are drawn.
+    /// against: occluders are discovered by layer mask, written into the volume once per frame,
+    /// and bound as global shader state. Cost is independent of how many beams are drawn.
+    ///
+    /// Two ways in, chosen by <see cref="MeshVoxelize"/>: rasterizing the occluders' real meshes
+    /// (the default — exact silhouettes, but a draw call per renderer per axis), or splatting
+    /// approximating shapes with a compute pass (oriented boxes from renderer bounds, per-bone
+    /// spheres for skinned meshes, or an authored <see cref="StageBeamOccluderHint"/> — no draw
+    /// calls at all). Hints apply in both modes.
     ///
     /// Boxes come from <see cref="Renderer.localBounds"/> + the transform — no per-object setup
     /// needed — so walls, risers, panels and cases occlude with their actual silhouette. When a
@@ -35,8 +39,13 @@ namespace Origuma.StageBeam
         /// <summary>Voxelize the occluders' REAL meshes (3-axis rasterization into the volume)
         /// instead of approximating them with spheres/boxes. Silhouettes become the actual
         /// render geometry — skinned poses and cloth deformation included — while the shared
-        /// volume keeps the cost independent of the light count. Off = legacy shape splatting
-        /// (bone spheres / bounds boxes / hint shapes).</summary>
+        /// volume keeps the cost independent of the light count. Off = shape splatting
+        /// (bone spheres / bounds boxes).
+        ///
+        /// A <see cref="StageBeamOccluderHint"/> still wins in EITHER mode: a hinted subtree is
+        /// splatted as its authored shape and taken out of the raster set. That is what makes the
+        /// hint a cost lever (a character's renderers stop costing a draw call each) as well as
+        /// what makes its Ignore option mean Ignore here.</summary>
         public bool MeshVoxelize = true;
 
         public bool ArticulateSkinnedMeshes = true;
@@ -95,6 +104,33 @@ namespace Origuma.StageBeam
         public int OccluderCount => _occluders.Count;
         public Vector3 BoxCenter => _wc;
         public Vector3 BoxSize => _ws;
+
+        /// <summary>
+        /// Draw calls recorded by the LAST GPU build — the mesh-voxelize cost, which is what
+        /// actually scales with the scene.
+        ///
+        /// Exists because the build runs through Graphics.ExecuteCommandBuffer, OUTSIDE the render
+        /// graph, so the Frame Debugger cannot see any of it. Without a counter there is no way to
+        /// tell whether a change made this cheaper or more expensive. Counted while RECORDING, so
+        /// it costs an increment per call and nothing else.
+        /// </summary>
+        public int LastVoxelizeDrawCalls => _statDraws;
+        /// <summary>Occluders that actually rasterized last build (active and within MaxOccluderSize).</summary>
+        public int LastVoxelizedOccluders => _statOccluders;
+        /// <summary>Of those, how many were treated as dynamic (skinned, or moved since last build).</summary>
+        public int LastDynamicOccluders => _statDynamic;
+        /// <summary>True when the cached static volume was re-voxelized last build (the expensive case).</summary>
+        public bool LastRebuiltStatic => _statRebuiltStatic;
+        /// <summary>Distinct StageBeamOccluderHint components found above the collected occluders.
+        /// Zero means no hint is in play — so no subtree is being represented by a cheap shape.</summary>
+        public int HintCount => _statHints;
+        /// <summary>Occluders taken out of the raster set because a hint represents them.</summary>
+        public int HintCoveredOccluders => _statHintCovered;
+
+        private int _statDraws, _statOccluders, _statDynamic;
+        private int _statHints, _statHintCovered;
+        private bool _statRebuiltStatic;
+        private bool _warnedSphereOverflow;
         public Vector4 GetSphere(int i) => _spheres != null && i < _spheres.Length ? _spheres[i] : default;
         public void GetBox(int i, out Vector3 center, out Vector3 halfExtents, out Quaternion rotation)
         {
@@ -212,6 +248,8 @@ namespace Origuma.StageBeam
         public void RecordGpuBuild(CommandBuffer cmd)
         {
             if (_volume == null || _spheres == null) return;
+            _statDraws = 0;
+            _statRebuiltStatic = false;
             RecordUploadAndDispatch(cmd);
             if (MeshVoxelize)
             {
@@ -316,12 +354,29 @@ namespace Origuma.StageBeam
             _lastMatrices = null;
         }
 
+        // Occluders represented by a StageBeamOccluderHint this build, so the mesh voxelizer skips
+        // them. Reset every gather because a hint can be added, removed or disabled at any time.
+        private bool[] _hintCovered;
+
+        private void MarkHintCovered(int index)
+        {
+            if (_hintCovered == null || _hintCovered.Length < _occluders.Count)
+                _hintCovered = new bool[Mathf.Max(_occluders.Count, 8)];
+            if (!_hintCovered[index]) _statHintCovered++;
+            _hintCovered[index] = true;
+        }
+
         private void GatherOccluders()
         {
             _sphereCount = 0;
             _boxCount = 0;
             _hasFit = false;
             _emittedHints.Clear();
+            if (_hintCovered != null) System.Array.Clear(_hintCovered, 0, _hintCovered.Length);
+            _statHintCovered = 0;
+            _statHints = 0;
+            for (var h = 0; h < _occluderHints.Count; h++)
+                if (_occluderHints[h] != null) _statHints++;
 
             for (var i = 0; i < _occluders.Count; i++)
             {
@@ -330,12 +385,28 @@ namespace Origuma.StageBeam
                 // contribute nothing to the volume until their GameObject is enabled.
                 if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
 
+                var hint = i < _occluderHints.Count ? _occluderHints[i] : null;
+
                 // Mesh voxelization: real geometry goes straight into the volume (see
                 // VoxelizeMeshes), so no approximation shapes are emitted here — this pass
                 // only accumulates the AutoFit bounds. Skinned fit still comes from bone
                 // positions so inflated culling bounds don't balloon the box.
                 if (MeshVoxelize)
                 {
+                    // A hint still WINS in mesh mode. Rasterizing a hinted subtree would both
+                    // duplicate the shape it already declares and pay a draw call per renderer —
+                    // the expensive half of a character (body, hair, clothes, cloth proxies) for a
+                    // silhouette the voxel grid quantises away anyway. So the shape is splatted by
+                    // the compute pass (no draw calls) and the renderers are taken out of the
+                    // raster set. This is also what makes Ignore mean Ignore here: without it a
+                    // subtree marked "casts no volumetric shadow" still voxelized.
+                    if (hint != null)
+                    {
+                        MarkHintCovered(i);
+                        if (_emittedHints.Add(hint)) EmitHint(hint);
+                        continue;
+                    }
+
                     if (r is SkinnedMeshRenderer skinned &&
                         TryComputeSkeletonBounds(skinned, out var skelFit))
                     {
@@ -353,7 +424,6 @@ namespace Origuma.StageBeam
 
                 // Explicit hint: the whole subtree occludes as ONE authored shape — stable and
                 // visible in the Scene view, immune to cloth-sim bones / inflated bounds.
-                var hint = i < _occluderHints.Count ? _occluderHints[i] : null;
                 if (hint != null)
                 {
                     if (_emittedHints.Add(hint)) EmitHint(hint);
@@ -393,7 +463,9 @@ namespace Origuma.StageBeam
             }
         }
 
-        private static readonly StageBeamOccluderHint.Segment[] HintSegments =
+        // Grown to whatever the hint needs: one hint can represent a whole cast, and a fixed
+        // 24-segment buffer would quietly keep only the first character's capsules.
+        private static StageBeamOccluderHint.Segment[] HintSegments =
             new StageBeamOccluderHint.Segment[StageBeamOccluderHint.MaxSegments];
 
         // One authored shape for a whole hinted subtree. Contributes to AutoFit like any other
@@ -411,6 +483,9 @@ namespace Origuma.StageBeam
 
             if (hint.Shape == StageBeamOccluderHint.OccluderShape.HumanoidCapsules)
             {
+                int need = hint.HumanoidSegmentCapacity;
+                if (HintSegments.Length < need)
+                    HintSegments = new StageBeamOccluderHint.Segment[need];
                 int n = hint.FillHumanoidSegments(HintSegments);
                 if (n > 0)
                 {
@@ -535,7 +610,20 @@ namespace Origuma.StageBeam
 
         private void EmitSphere(Vector3 center, float radius)
         {
-            if (_sphereCount >= _spheres.Length) return;
+            if (_sphereCount >= _spheres.Length)
+            {
+                // Silent truncation reads as "that character casts no shadow" with nothing to go
+                // on. An articulated humanoid costs ~17 spheres, so a cast of eight overruns the
+                // default 128 — say so once instead of letting shadows quietly disappear.
+                if (!_warnedSphereOverflow)
+                {
+                    _warnedSphereOverflow = true;
+                    Debug.LogWarning($"[StageBeam] Occluder shape budget full ({_spheres.Length}) — " +
+                        "further shapes are dropped and will cast no volumetric shadow. Raise " +
+                        "Max Occluders (an articulated humanoid costs ~17 shapes).");
+                }
+                return;
+            }
             _spheres[_sphereCount++] = new Vector4(center.x, center.y, center.z,
                                                    Mathf.Max(radius, 1e-3f));
         }
@@ -685,10 +773,10 @@ namespace Origuma.StageBeam
             cmd.DispatchCompute(Occlusion, _splatKernel, gx, gy, gz);
         }
 
+        private static readonly int IdVoxTargetRT   = Shader.PropertyToID("_StageBeamVoxelizeRT");
         private static readonly int IdVoxVolMin     = Shader.PropertyToID("_VoxVolMin");
         private static readonly int IdVoxVolInvSize = Shader.PropertyToID("_VoxVolInvSize");
         private static readonly int IdVoxRes        = Shader.PropertyToID("_VoxRes");
-        private static readonly int IdVoxTargetRT   = Shader.PropertyToID("_StageBeamVoxelizeRT");
 
         /// <summary>
         /// Rasterizes the occluders' real meshes into the occupancy volume: three orthographic
@@ -744,6 +832,7 @@ namespace Origuma.StageBeam
                     DispatchClear(cmd, _volumeStatic);
                     VoxelizeAxes(cmd, _volumeStatic, VoxClass.Static);
                     _staticVolumeValid = true;
+                    _statRebuiltStatic = true;
                 }
                 // _volume was already cleared by RecordUploadAndDispatch (Clear + empty Splat).
                 VoxelizeAxes(cmd, _volume, VoxClass.Dynamic);
@@ -779,12 +868,19 @@ namespace Origuma.StageBeam
             }
 
             _staticDirty = false;
+            _statOccluders = 0;
+            _statDynamic = 0;
             for (var i = 0; i < n; i++)
             {
                 var r = _occluders[i];
                 bool active = r != null && r.enabled && r.gameObject.activeInHierarchy;
-                _voxelizeFlags[i] = active &&
+                // A hinted subtree already contributed its authored shape via the compute splat —
+                // rasterizing it too would double the occupancy and cost a draw call per renderer.
+                bool hinted = _hintCovered != null && i < _hintCovered.Length && _hintCovered[i];
+                _voxelizeFlags[i] = active && !hinted &&
                     (MaxOccluderSize <= 0f || r.bounds.extents.magnitude * 2f <= MaxOccluderSize);
+
+                if (_voxelizeFlags[i]) _statOccluders++;
 
                 if (!doSplit) continue;   // dynamic classification only needed for the split
                 Matrix4x4 m = r != null ? r.transform.localToWorldMatrix : Matrix4x4.identity;
@@ -794,6 +890,7 @@ namespace Origuma.StageBeam
                 if (dyn != _wasDynamic[i]) _staticDirty = true;
                 _dynamicFlags[i] = dyn;
                 _wasDynamic[i]   = dyn;
+                if (dyn && _voxelizeFlags[i]) _statDynamic++;
             }
         }
 
@@ -867,7 +964,10 @@ namespace Origuma.StageBeam
                 int subs = _occluderSubMeshes != null && i < _occluderSubMeshes.Length
                     ? _occluderSubMeshes[i] : 1;
                 for (int sm = 0; sm < subs; sm++)
+                {
                     cmd.DrawRenderer(r, _voxelizeMat, sm, 0);
+                    _statDraws++;
+                }
             }
         }
 

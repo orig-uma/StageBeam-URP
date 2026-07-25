@@ -105,6 +105,8 @@ Feature set **Shadows**:
   cloth deformation included — at voxel resolution (~3–4 cm at the default fit), then softly
   dilated so the shadow march can't miss thin features. No spheres, no capsules, no per-object
   setup. (Mesh Voxelize off = legacy sphere/box approximation, cheaper on very weak GPUs.)
+  Accuracy has a price: rasterizing costs one draw call **per renderer per axis**, so a scene of
+  animated characters runs into the hundreds — see the Occluder Hint note below for the lever.
   Occluders on the feature's **Occluder Mask** layers are discovered every frame and voxelized
   once per frame; the cost is independent of the number of beams. Static meshes become oriented
   boxes straight from their renderer bounds (no setup needed — walls, risers, panels and cases
@@ -134,8 +136,17 @@ The default **Humanoid Capsules** mode builds capsules along the Humanoid avatar
 (torso, head, arms, legs, plus armpit/crotch connector segments so no false light slivers
 leak between limbs and torso under an overhead light): it follows animation exactly and the
 Humanoid mapping never includes cloth/hair bones, so cloth sims can't skew it; **Limb
-Radius** scales the whole set. With no humanoid Animator it falls back to the single vertical **Capsule**
-(height/radius fields). **Box** and **Ignore** cover set pieces and exclusions.
+Radius** scales the whole set. It covers **every humanoid below the hint**, so one component on
+a cast's root represents the whole cast. With no humanoid Animator it falls back to the single
+vertical **Capsule** (height/radius fields). **Box** and **Ignore** cover set pieces and
+exclusions.
+
+A hint applies with **Mesh Voxelize either on or off**: the hinted subtree is splatted as its
+authored shape and taken *out* of the raster set. That makes it a **cost lever** as well as an
+accuracy fix — mesh voxelization spends a draw call per renderer per axis, so a cast of dancers
+is hundreds of them, while the splat costs none. Watch the shape budget: **Max Occluders**
+(articulated humanoid ≈ 17 shapes each); a warning is logged if shapes are dropped.
+`Window > Origuma > Stage Beam > Log Occlusion Build Cost` prints the current counts.
 
 **Shadow edges chattering on moving characters**: the voxel grid quantizes a moving occluder's
 silhouette, so it snaps between cells frame to frame. The feature's **Volume ▸ Temporal**
