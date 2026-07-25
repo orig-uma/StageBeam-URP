@@ -356,11 +356,21 @@ namespace Origuma.StageBeam
             }
 
 #if UNITY_EDITOR
-            // The occupancy build runs an immediate Graphics.ExecuteCommandBuffer OUTSIDE the
-            // RenderGraph, which stops the Frame Debugger from freezing a frame (it re-submits GPU
-            // work on every repaint). While the editor is PAUSED — the Frame Debugger's normal use
-            // — skip the rebuild entirely: returning null keeps the last-bound volume + globals, so
-            // the shadow holds its last state and the debugger can capture a stable frame.
+            // THE reason the Frame Debugger never shows this build — and why Set Pass Calls
+            // drops in the Statistics panel the moment the debugger pauses the game: while the
+            // editor is paused, this returns null and the build is skipped ON PURPOSE.
+            //
+            // The GPU half executes through Graphics.ExecuteCommandBuffer outside the render
+            // graph, so during a pause it would be re-submitted on every editor repaint — work
+            // the Frame Debugger cannot attribute to any pass and which destabilises its
+            // capture. Skipping keeps the last-bound volume + globals live (the shadow holds its
+            // final state, so the paused image still looks right) and the capture stable, at the
+            // price of the build being invisible in it.
+            //
+            // Moving the build into the render graph is the real fix; two attempts failed and
+            // were reverted (see the note at the BuildAndBind call site). Until then,
+            // Window > Origuma > Stage Beam > Log Occlusion Build Cost — run while PLAYING —
+            // is the accounting for what this skipped work costs.
             if (UnityEditor.EditorApplication.isPaused) return null;
 #endif
 
@@ -373,30 +383,13 @@ namespace Origuma.StageBeam
             // `elapsed >= 0` guards against Time.frameCount RESETTING below the stored build
             // frame (it resets on Play enter while this feature instance — and its
             // _occlusionBuiltFrame — persist across sessions): a negative elapsed must NOT be
-            // read as "within the interval" or the volume would never rebuild.
-            // Interval throttling keys off Time.frameCount, which FREEZES while the editor is
-            // paused — and pausing is exactly what the Frame Debugger does to capture a frame.
-            // Left as a bare frame-count compare, `elapsed` stays 0 on every repaint after the
-            // pause, the build is skipped forever, and the consequences look like two unrelated
-            // bugs: the occlusion work is absent from the captured frame (so it can never be
-            // inspected — the very thing one opens the Frame Debugger for), and the shadow
-            // globals stop being published, so beams render unshadowed and blown out.
-            //
-            // The pause exception is gated on the editor ACTUALLY being paused, not on
-            // elapsed == 0 alone: during play a second camera rendering the same frame (a visible
-            // Scene view) also sees elapsed == 0, and treating that as "frozen" would rebuild the
-            // volume once per CAMERA instead of once per frame. `elapsed >= 0` stays deliberate —
-            // Time.frameCount resets on Play enter while this feature instance persists, and a
-            // negative elapsed must read as "rebuild now", never "within the interval".
+            // read as "within the interval" or the volume would never rebuild. The equality
+            // half also dedupes multiple cameras in the same frame — a visible Scene view
+            // renders the same frameCount and must not trigger a second build.
             if (Application.isPlaying)
             {
-                bool paused = false;
-#if UNITY_EDITOR
-                paused = UnityEditor.EditorApplication.isPaused;
-#endif
                 int elapsed = Time.frameCount - _occlusionBuiltFrame;
-                if (!paused && elapsed >= 0 && elapsed < Mathf.Max(1, _volUpdateInterval))
-                    return null;
+                if (elapsed >= 0 && elapsed < Mathf.Max(1, _volUpdateInterval)) return null;
                 _occlusionBuiltFrame = Time.frameCount;
             }
 
