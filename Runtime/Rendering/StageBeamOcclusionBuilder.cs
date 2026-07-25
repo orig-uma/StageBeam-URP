@@ -140,12 +140,42 @@ namespace Origuma.StageBeam
         /// <summary>Time.frameCount of the last recorded build (staleness check for the report).</summary>
         public int LastBuildFrame => _statBuildFrame;
 
+        /// <summary>
+        /// Of the dynamic occluders, how many are NON-skinned meshes that changed their matrix
+        /// since the previous build — and how big the largest change was. This separates the two
+        /// situations "everything is dynamic" collapses together: matrices moving by visible
+        /// amounts (fixtures actually panning — the cost is real; the lever is instancing) versus
+        /// micro-jitter far below a voxel (easing/animation rewriting near-identical values every
+        /// frame — an epsilon in the comparison would return those to the static cache with no
+        /// visible change, since a voxel is centimetres).
+        /// </summary>
+        public int LastMovedMeshCount => _statMovedMeshes;
+        /// <summary>Largest matrix-element change among those movers (world units).</summary>
+        public float LastMaxMovedDelta => _statMaxMovedDelta;
+        /// <summary>The renderer with that largest change (name resolved by the report, not here —
+        /// Renderer.name allocates).</summary>
+        public Renderer LastMaxMovedRenderer => _statMaxMovedRenderer;
+
         private int _statDraws, _statOccluders, _statDynamic;
         private int _statHints, _statHintCovered;
         private int _statBuildFrame = -1;
+        private int _statMovedMeshes;
+        private float _statMaxMovedDelta;
+        private Renderer _statMaxMovedRenderer;
         private bool _statMatrixReset;
         private bool _statRebuiltStatic;
         private bool _warnedSphereOverflow;
+
+        private static float MaxAbsElementDelta(in Matrix4x4 a, in Matrix4x4 b)
+        {
+            float max = 0f;
+            for (int e = 0; e < 16; e++)
+            {
+                float d = Mathf.Abs(a[e] - b[e]);
+                if (d > max) max = d;
+            }
+            return max;
+        }
         public Vector4 GetSphere(int i) => _spheres != null && i < _spheres.Length ? _spheres[i] : default;
         public void GetBox(int i, out Vector3 center, out Vector3 halfExtents, out Quaternion rotation)
         {
@@ -888,6 +918,9 @@ namespace Origuma.StageBeam
             _statOccluders = 0;
             _statDynamic = 0;
             _statMatrixReset = false;
+            _statMovedMeshes = 0;
+            _statMaxMovedDelta = 0f;
+            _statMaxMovedRenderer = null;
             for (var i = 0; i < n; i++)
             {
                 var r = _occluders[i];
@@ -903,6 +936,14 @@ namespace Origuma.StageBeam
                 if (!doSplit) continue;   // dynamic classification only needed for the split
                 Matrix4x4 m = r != null ? r.transform.localToWorldMatrix : Matrix4x4.identity;
                 bool moved = matricesReset || m != _lastMatrices[i];
+                // Measure BEFORE the cache is overwritten: how far did the movers actually move?
+                if (moved && !matricesReset && active && _voxelizeFlags[i] &&
+                    !(r is SkinnedMeshRenderer))
+                {
+                    _statMovedMeshes++;
+                    float d = MaxAbsElementDelta(in m, in _lastMatrices[i]);
+                    if (d > _statMaxMovedDelta) { _statMaxMovedDelta = d; _statMaxMovedRenderer = r; }
+                }
                 _lastMatrices[i] = m;
                 bool dyn = active && ((r is SkinnedMeshRenderer) || moved);
                 if (dyn != _wasDynamic[i]) _staticDirty = true;

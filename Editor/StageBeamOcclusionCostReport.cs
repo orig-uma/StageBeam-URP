@@ -43,6 +43,12 @@ namespace Origuma.StageBeam.Editor
                 $"  occluder hints       : {b.HintCount} found, covering {b.HintCoveredOccluders} renderer(s)\n" +
                 $"  matrix cache reset   : {(b.LastMatrixCacheReset ? "YES (movement compare had no history)" : "no")}\n" +
                 $"  builder instance     : #{b.GetHashCode():x8}, built at frame {b.LastBuildFrame} (now {Time.frameCount})\n" +
+                $"  dynamic breakdown    : {b.LastDynamicOccluders - b.LastMovedMeshCount} skinned, " +
+                $"{b.LastMovedMeshCount} moved mesh(es), largest move Δ{b.LastMaxMovedDelta:g3}" +
+                $"{(b.LastMaxMovedRenderer != null ? $" on '{b.LastMaxMovedRenderer.name}'" : "")}\n" +
+                "  Reading Δ: ~1e-6..1e-4 is micro-jitter (easing rewriting near-identical values — " +
+                "an epsilon would return these to the static cache; a voxel is centimetres). " +
+                "Large Δ = real motion; the lever is instancing, not cache repair.\n" +
                 "  Each draw call carries its own SetPass, so this is what the Statistics panel " +
                 "loses when the Frame Debugger pauses the game.");
         }
