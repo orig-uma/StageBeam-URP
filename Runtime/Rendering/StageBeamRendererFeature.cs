@@ -374,18 +374,28 @@ namespace Origuma.StageBeam
             // frame (it resets on Play enter while this feature instance — and its
             // _occlusionBuiltFrame — persist across sessions): a negative elapsed must NOT be
             // read as "within the interval" or the volume would never rebuild.
-            // Interval throttling keys off Time.frameCount, which FREEZES while the game is paused —
-            // and pausing is exactly what the Frame Debugger does to capture a frame. Left as a bare
-            // frame-count compare, `elapsed` stays 0 on every repaint after the pause, the build is
-            // skipped forever, and the consequences look like two unrelated bugs: the occlusion work
-            // is absent from the captured frame (so it can never be inspected — the very thing one
-            // opens the Frame Debugger for), and the shadow globals stop being published, so beams
-            // render unshadowed and blown out. Detect the frozen counter and build anyway.
+            // Interval throttling keys off Time.frameCount, which FREEZES while the editor is
+            // paused — and pausing is exactly what the Frame Debugger does to capture a frame.
+            // Left as a bare frame-count compare, `elapsed` stays 0 on every repaint after the
+            // pause, the build is skipped forever, and the consequences look like two unrelated
+            // bugs: the occlusion work is absent from the captured frame (so it can never be
+            // inspected — the very thing one opens the Frame Debugger for), and the shadow
+            // globals stop being published, so beams render unshadowed and blown out.
+            //
+            // The pause exception is gated on the editor ACTUALLY being paused, not on
+            // elapsed == 0 alone: during play a second camera rendering the same frame (a visible
+            // Scene view) also sees elapsed == 0, and treating that as "frozen" would rebuild the
+            // volume once per CAMERA instead of once per frame. `elapsed >= 0` stays deliberate —
+            // Time.frameCount resets on Play enter while this feature instance persists, and a
+            // negative elapsed must read as "rebuild now", never "within the interval".
             if (Application.isPlaying)
             {
+                bool paused = false;
+#if UNITY_EDITOR
+                paused = UnityEditor.EditorApplication.isPaused;
+#endif
                 int elapsed = Time.frameCount - _occlusionBuiltFrame;
-                bool timeFrozen = elapsed == 0;   // repaint without the frame counter advancing
-                if (!timeFrozen && elapsed > 0 && elapsed < Mathf.Max(1, _volUpdateInterval))
+                if (!paused && elapsed >= 0 && elapsed < Mathf.Max(1, _volUpdateInterval))
                     return null;
                 _occlusionBuiltFrame = Time.frameCount;
             }
