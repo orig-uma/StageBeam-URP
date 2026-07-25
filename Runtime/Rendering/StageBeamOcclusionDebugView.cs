@@ -16,13 +16,33 @@ namespace Origuma.StageBeam
         [Tooltip("Also draw when the object is not selected.")]
         public bool AlwaysDraw = true;
 
-        private void OnDrawGizmos() { if (AlwaysDraw) Draw(); }
-        private void OnDrawGizmosSelected() { if (!AlwaysDraw) Draw(); }
+        [Tooltip("Print the last build's draw-call count above the volume box. The occupancy " +
+                 "build runs outside the render graph, so the Frame Debugger cannot show it — " +
+                 "this is the only way to see what the mesh voxelizer actually costs.")]
+        public bool ShowBuildCost = true;
 
-        private static void Draw()
+        private void OnDrawGizmos() { if (AlwaysDraw) Draw(ShowBuildCost); }
+        private void OnDrawGizmosSelected() { if (!AlwaysDraw) Draw(ShowBuildCost); }
+
+        private static void Draw(bool showCost)
         {
             var b = StageBeamOcclusionBuilder.ActiveDebug;
             if (b == null) return;
+
+#if UNITY_EDITOR
+            if (showCost)
+            {
+                // Static rebuilds are the expensive case, so they are called out: a scene where
+                // this says "static REBUILT" every frame has something jittering in it, and the
+                // static/dynamic split is buying nothing.
+                UnityEditor.Handles.Label(
+                    b.BoxCenter + Vector3.up * (b.BoxSize.y * 0.5f + 0.25f),
+                    $"voxelize draws {b.LastVoxelizeDrawCalls}   " +
+                    $"occluders {b.LastVoxelizedOccluders}/{b.OccluderCount}   " +
+                    $"dynamic {b.LastDynamicOccluders}" +
+                    (b.LastRebuiltStatic ? "   [static REBUILT]" : ""));
+            }
+#endif
 
             Gizmos.color = new Color(0.3f, 0.7f, 1f, 0.4f);
             Gizmos.DrawWireCube(b.BoxCenter, b.BoxSize);
