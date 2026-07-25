@@ -99,6 +99,7 @@ https://github.com/orig-uma/StageBeam-URP.git#v0.1.0
 | [USAGE](Documentation~/USAGE.md) | 導入・Renderer Feature 設定・全パラメータ・影モード・負荷ガイド |
 | [PERFORMANCE](Documentation~/PERFORMANCE.md) | Soft Additive 合成モデルと最適化手法（共有影/間引き/GPU インスタンシング/実測） |
 | [ARCHITECTURE](Documentation~/ARCHITECTURE.md) | 内部構成・設計方針（レイヤ構成/コーンシェーダ/占有ボリューム） |
+| [LightBeamDesign](Documentation~/LightBeamDesign.md) | 描画系の設計定義（縮小バッファ/レイマーチング/性能予算/フェーズ計画） |
 
 ## 関連パッケージ
 
