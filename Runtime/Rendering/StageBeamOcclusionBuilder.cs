@@ -303,6 +303,7 @@ namespace Origuma.StageBeam
         private static readonly int IdTriBaseVertex   = Shader.PropertyToID("_TriBaseVertex");
         private static readonly int IdTriIndex16      = Shader.PropertyToID("_TriIndex16");
         private static readonly int IdTriVertStride   = Shader.PropertyToID("_TriVertStride");
+        private static readonly int IdTriPosOffset    = Shader.PropertyToID("_TriPosOffset");
         private static readonly int IdTriLocalToWorld = Shader.PropertyToID("_TriLocalToWorld");
 
         /// <summary>The most recently built builder (auto or override) — lets
@@ -932,6 +933,10 @@ namespace Origuma.StageBeam
                 if (!(_occluders[i] is SkinnedMeshRenderer smr)) continue;
                 var mesh = smr.sharedMesh;
                 if (mesh == null) continue;
+                // Exotic layout (position outside stream 0 — the stream skinning deforms):
+                // leave the renderer on the raster path rather than read garbage.
+                if (mesh.GetVertexAttributeStream(UnityEngine.Rendering.VertexAttribute.Position) != 0)
+                    continue;
 
                 // The skinned output and the index buffer need raw (ByteAddressBuffer) access.
                 // Enabling the target can take a frame to materialise, during which
@@ -969,19 +974,31 @@ namespace Origuma.StageBeam
                     boundVolume = true;
                 }
 
-                // The skin output stream is position (+normal) (+tangent), position first —
-                // stride follows from which of those the mesh carries.
-                int stride = 12
-                    + (mesh.HasVertexAttribute(UnityEngine.Rendering.VertexAttribute.Normal)  ? 12 : 0)
-                    + (mesh.HasVertexAttribute(UnityEngine.Rendering.VertexAttribute.Tangent) ? 16 : 0);
+                // Layout comes from the DATA, not assumptions. The skin output shares stream 0's
+                // layout (skinning deforms stream 0 and copies anything else there through), so
+                // the mesh's stream-0 stride and position offset are authoritative — and the
+                // buffer's own stride wins outright when available: it describes the actual
+                // allocation. A hand-derived pos+normal+tangent guess sat here once and read
+                // garbage on any mesh whose stream 0 carried more than that.
+                int stride = vb.stride >= 12 ? vb.stride : mesh.GetVertexBufferStride(0);
+                int posOffset = Mathf.Max(0, mesh.GetVertexAttributeOffset(
+                    UnityEngine.Rendering.VertexAttribute.Position));
 
                 cmd.SetComputeBufferParam(Occlusion, _triKernel, IdTriVerts, vb);
                 cmd.SetComputeBufferParam(Occlusion, _triKernel, IdTriIndices, ib);
                 cmd.SetComputeIntParam(Occlusion, IdTriVertStride, stride);
+                cmd.SetComputeIntParam(Occlusion, IdTriPosOffset, posOffset);
                 cmd.SetComputeIntParam(Occlusion, IdTriIndex16,
                     mesh.indexFormat == UnityEngine.Rendering.IndexFormat.UInt16 ? 1 : 0);
+                // GPU skinning outputs vertices relative to the renderer's skinning ROOT — the
+                // root bone when one is assigned, else the renderer's own transform. This is the
+                // same matrix VFX Graph's "Get Skinned Mesh World Root Transform" supplies for
+                // exactly this reconstruction; multiplying by smr.transform instead put every
+                // vertex in the wrong place (the classic tell: moving an SMR's own transform
+                // doesn't move the rendered mesh — bones, not the SMR node, define its space).
+                var skinRoot = smr.rootBone != null ? smr.rootBone : smr.transform;
                 cmd.SetComputeMatrixParam(Occlusion, IdTriLocalToWorld,
-                    smr.transform.localToWorldMatrix);
+                    skinRoot.localToWorldMatrix);
 
                 for (int sm = 0; sm < mesh.subMeshCount; sm++)
                 {

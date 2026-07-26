@@ -186,7 +186,8 @@ uint     _TriIndexCount;        // submesh: index count (multiple of 3)
 uint     _TriBaseVertex;        // submesh: value added to every index
 uint     _TriIndex16;           // 1 = 16-bit indices
 uint     _TriVertStride;        // bytes per vertex in _TriVerts
-float4x4 _TriLocalToWorld;      // renderer local -> world
+uint     _TriPosOffset;         // byte offset of the position inside a vertex
+float4x4 _TriLocalToWorld;      // skinning-root local -> world
 
 uint LoadTriIndex(uint element)
 {
@@ -203,7 +204,7 @@ uint LoadTriIndex(uint element)
 // Vertex position in VOXEL space (continuous voxel coordinates).
 float3 LoadTriPosVox(uint vertexIndex)
 {
-    float3 p  = asfloat(_TriVerts.Load3(vertexIndex * _TriVertStride));
+    float3 p  = asfloat(_TriVerts.Load3(vertexIndex * _TriVertStride + _TriPosOffset));
     float3 ws = mul(_TriLocalToWorld, float4(p, 1.0)).xyz;
     return (ws - _VolMin) / max(_VolSize, 1e-4) * float3(_Res);
 }

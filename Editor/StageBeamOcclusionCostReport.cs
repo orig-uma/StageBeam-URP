@@ -87,7 +87,31 @@ namespace Origuma.StageBeam.Editor
             sb.AppendLine($"<color=#5aa9e6>[StageBeam]</color> Occluder roots ({occluders.Count} renderer(s) collected):");
             foreach (var kv in groups)
                 sb.AppendLine($"  {kv.Key,-40} skinned {kv.Value[0],4}   mesh {kv.Value[1],4}   inactive {kv.Value[2],4}");
-            sb.Append("  'skinned' rows are what the voxelizer redraws every build (skinned = always dynamic).");
+
+            // Skinned layout probe: when the compute voxelizer writes nothing (shadows vanish),
+            // the numbers below are the usual suspects — buffer stride vs mesh claim, position
+            // offset, index format, and WHERE the skinning root actually sits versus the SMR
+            // node (the space the skinned buffer is relative to).
+            var probed = new System.Collections.Generic.HashSet<Mesh>();
+            int probes = 0;
+            for (int i = 0; i < occluders.Count && probes < 4; i++)
+            {
+                if (!(occluders[i] is SkinnedMeshRenderer smr) || smr.sharedMesh == null) continue;
+                var mesh = smr.sharedMesh;
+                if (!probed.Add(mesh)) continue;
+                probes++;
+                var vb = smr.GetVertexBuffer();
+                var root = smr.rootBone != null ? smr.rootBone : smr.transform;
+                sb.AppendLine(
+                    $"  skin probe '{mesh.name}': vb {(vb != null ? $"stride {vb.stride}" : "NULL")}, " +
+                    $"stream0 stride {mesh.GetVertexBufferStride(0)}, " +
+                    $"posOffset {mesh.GetVertexAttributeOffset(UnityEngine.Rendering.VertexAttribute.Position)}, " +
+                    $"posStream {mesh.GetVertexAttributeStream(UnityEngine.Rendering.VertexAttribute.Position)}, " +
+                    $"idx {mesh.indexFormat}, root '{root.name}' @ {root.position}, smr @ {smr.transform.position}");
+                vb?.Dispose();
+            }
+
+            sb.Append("  'skinned' rows go through the compute voxelizer (zero draws) when their buffers are accessible.");
             Debug.Log(sb.ToString());
         }
     }
