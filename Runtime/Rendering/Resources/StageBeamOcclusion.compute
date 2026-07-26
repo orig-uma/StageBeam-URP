@@ -219,6 +219,28 @@ void VoxelizeTriangles(uint3 id : SV_DispatchThreadID)
     float3 v1 = LoadTriPosVox(LoadTriIndex(_TriIndexStart + first + 1) + _TriBaseVertex);
     float3 v2 = LoadTriPosVox(LoadTriIndex(_TriIndexStart + first + 2) + _TriBaseVertex);
 
+    float3 lo = min(v0, min(v1, v2));
+    float3 hi = max(v0, max(v1, v2));
+
+    // Wholly outside the grid: bail before sampling. Without this a triangle beyond the volume
+    // still ran its full sample loop only to fail the per-sample bounds test every time — the
+    // cost of geometry the volume does not even cover.
+    if (any(hi < 0.0) || any(lo >= float3(_Res))) return;
+
+    int3 c0 = (int3)floor(lo);
+    int3 c1 = (int3)floor(hi);
+
+    // THE common case at centimetre voxels: the whole triangle sits inside one voxel, so the
+    // barycentric sweep below would write that same voxel three-plus times over. Character
+    // meshes are almost entirely this — 160k triangles across performers whose limbs are tens
+    // of voxels wide — so collapsing it to a single write is most of the pass's work removed,
+    // and the result is bit-identical because the sweep could only ever set this one voxel.
+    if (all(c0 == c1))
+    {
+        if (all(c0 >= 0) && all(c0 < (int3)_Res)) _Occ[c0] = 1.0;
+        return;
+    }
+
     // Sample density ~2 per voxel along the longest edge. Clamped so one oversized triangle
     // cannot stall its wavefront — character triangles are far smaller than a voxel (N=1-2);
     // the clamp only bites on set-piece-sized geometry, which this path is not used for.
@@ -227,10 +249,17 @@ void VoxelizeTriangles(uint3 id : SV_DispatchThreadID)
     uint   N  = (uint)clamp(ceil(max(length(e1), length(e2)) * 2.0), 1.0, 48.0);
     float  inv = 1.0 / N;
 
+    // Consecutive samples along a row land in the same voxel whenever the sampling is finer
+    // than the grid, which is the point of sampling at 2 per voxel. Remembering the last cell
+    // turns those repeats into a compare instead of a memory write.
+    int3 last = int3(-2147483647, -2147483647, -2147483647);
+
     for (uint a = 0; a <= N; a++)
     for (uint b = 0; b <= N - a; b++)
     {
         int3 c = (int3)floor(v0 + e1 * (a * inv) + e2 * (b * inv));
+        if (all(c == last)) continue;
+        last = c;
         if (all(c >= 0) && all(c < (int3)_Res))
             _Occ[c] = 1.0;   // races benign: every writer writes the same solid value
     }
