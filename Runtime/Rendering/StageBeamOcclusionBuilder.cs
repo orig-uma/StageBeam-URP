@@ -193,6 +193,10 @@ namespace Origuma.StageBeam
         private Material _voxelizeMat;
         private int[] _occluderSubMeshes;   // parallel to _occluders, cached at rescan
         private readonly List<Renderer> _occluders = new List<Renderer>(128);
+
+        /// <summary>The collected occluder list, for editor diagnostics (the cost report's dump).
+        /// Read-only view; do not mutate through casts.</summary>
+        public IReadOnlyList<Renderer> OccludersForDebug => _occluders;
         // Per-occluder explicit shape override (StageBeamOccluderHint on a parent), resolved at
         // rescan time — parallel to _occluders. One hint covers many renderers; the emit pass
         // dedupes so a hinted character casts exactly one capsule/box.

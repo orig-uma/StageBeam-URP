@@ -52,5 +52,47 @@ namespace Origuma.StageBeam.Editor
                 "  Each draw call carries its own SetPass, so this is what the Statistics panel " +
                 "loses when the Frame Debugger pauses the game.");
         }
+
+        /// <summary>
+        /// Who ARE the occluders? Groups the collected list by root object and counts
+        /// skinned/static per root. Exists because the aggregate report can say "490 skinned"
+        /// while the Statistics panel says "Visible Skinned Meshes: 90" — the difference is
+        /// whatever the camera doesn't see or whatever one wouldn't expect to be skinned at all
+        /// (e.g. glTF fixture models whose parts import as SkinnedMeshRenderers), and no amount
+        /// of aggregate counting identifies it. Names do.
+        /// </summary>
+        [MenuItem("Window/Origuma/Stage Beam/Dump Occluder List", false, 201)]
+        private static void Dump()
+        {
+            var b = StageBeamOcclusionBuilder.ActiveDebug;
+            if (b == null)
+            {
+                Debug.LogWarning("[StageBeam] No occlusion builder is active. Enter Play mode with " +
+                                 "volumetric shadows enabled on the Stage Beam Renderer Feature.");
+                return;
+            }
+
+            // root name -> (skinned, mesh, inactive)
+            var groups = new System.Collections.Generic.Dictionary<string, int[]>();
+            var occluders = b.OccludersForDebug;
+            for (int i = 0; i < occluders.Count; i++)
+            {
+                var r = occluders[i];
+                if (r == null) continue;
+                string root = r.transform.root.name;
+                if (!groups.TryGetValue(root, out var c)) groups[root] = c = new int[3];
+                bool active = r.enabled && r.gameObject.activeInHierarchy;
+                if (!active) c[2]++;
+                else if (r is SkinnedMeshRenderer) c[0]++;
+                else c[1]++;
+            }
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"<color=#5aa9e6>[StageBeam]</color> Occluder roots ({occluders.Count} renderer(s) collected):");
+            foreach (var kv in groups)
+                sb.AppendLine($"  {kv.Key,-40} skinned {kv.Value[0],4}   mesh {kv.Value[1],4}   inactive {kv.Value[2],4}");
+            sb.Append("  'skinned' rows are what the voxelizer redraws every build (skinned = always dynamic).");
+            Debug.Log(sb.ToString());
+        }
     }
 }
