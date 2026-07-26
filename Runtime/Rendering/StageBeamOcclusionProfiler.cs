@@ -1,6 +1,4 @@
 using System.Collections.Generic;
-using UnityEngine;
-using UnityEngine.Profiling;   // CustomSampler (ProfilingSampler.sampler's type)
 using UnityEngine.Rendering;
 
 namespace Origuma.StageBeam
@@ -76,11 +74,11 @@ namespace Origuma.StageBeam
                 _samplers[passName] = sampler;
                 _order.Add(passName);
             }
-            // Begin with the SAMPLER, not its name: that is what ties the command buffer's GPU
-            // timing to this sampler's recorder. A name-based BeginSample opens an unrelated
-            // sampler whose timings this object can never read back.
-            cmd.BeginSample(sampler.sampler);
-            return new Scope(cmd, sampler.sampler);
+            // ProfilingScope takes the SAMPLER OBJECT, which is what ties the command buffer's GPU
+            // timing to that sampler's recorder — the thing Collect() reads. (Opening by name
+            // instead goes through a separately-owned sampler this object could never read back,
+            // and ProfilingSampler.sampler is not public to bridge the two by hand.)
+            return new Scope(cmd, sampler);
         }
 
         /// <summary>Reads back whatever the recorders have and refreshes the reported times.
@@ -112,18 +110,22 @@ namespace Origuma.StageBeam
             }
         }
 
-        public readonly struct Scope : System.IDisposable
+        /// <summary>Wraps a ProfilingScope so the disabled case can be a genuine no-op — a
+        /// default-constructed instance opens nothing and closes nothing.</summary>
+        public struct Scope : System.IDisposable
         {
-            private readonly CommandBuffer _cmd;
-            private readonly CustomSampler _sampler;
-            internal Scope(CommandBuffer cmd, CustomSampler sampler)
+            private ProfilingScope _inner;
+            private bool _active;
+            internal Scope(CommandBuffer cmd, ProfilingSampler sampler)
             {
-                _cmd = cmd;
-                _sampler = sampler;
+                _inner = new ProfilingScope(cmd, sampler);
+                _active = true;
             }
             public void Dispose()
             {
-                if (_cmd != null && _sampler != null) _cmd.EndSample(_sampler);
+                if (!_active) return;
+                _active = false;
+                _inner.Dispose();
             }
         }
     }
