@@ -1,6 +1,6 @@
 using System.Collections.Generic;
-using Unity.Profiling;
 using UnityEngine;
+using UnityEngine.Profiling;   // CustomSampler (ProfilingSampler.sampler's type)
 using UnityEngine.Rendering;
 
 namespace Origuma.StageBeam
