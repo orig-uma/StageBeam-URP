@@ -174,6 +174,12 @@ namespace Origuma.StageBeam
         /// would otherwise have cost one draw call (its own SetPass) per axis.</summary>
         public int LastComputeSkinned => _statComputeSkinned;
 
+        /// <summary>Per-pass GPU timing (opt-in via StageBeamOcclusionProfiler.Enabled). With the
+        /// draw calls gone, time is the only way to tell which of the full-volume compute passes
+        /// actually costs anything.</summary>
+        public StageBeamOcclusionProfiler Profiler => _profiler;
+        private readonly StageBeamOcclusionProfiler _profiler = new StageBeamOcclusionProfiler();
+
         private int _statDraws, _statOccluders, _statDynamic, _statDynSkinned;
         private int _statHints, _statHintCovered;
         private int _statBuildFrame = -1;
@@ -359,6 +365,7 @@ namespace Origuma.StageBeam
             for (int i = 0; i < _buffersInFlight.Count; i++) _buffersInFlight[i]?.Dispose();
             _buffersInFlight.Clear();
             (_buffersInFlight, _buffersThisBuild) = (_buffersThisBuild, _buffersInFlight);
+            _profiler.Collect();   // read back what finished on the GPU since the last build
             RecordUploadAndDispatch(cmd);
             if (MeshVoxelize)
             {
@@ -860,6 +867,30 @@ namespace Origuma.StageBeam
 
         private void RecordUploadAndDispatch(CommandBuffer cmd)
         {
+            var res = Resolution;
+            int gx = Mathf.CeilToInt(res.x / 4f);
+            int gy = Mathf.CeilToInt(res.y / 4f);
+            int gz = Mathf.CeilToInt(res.z / 4f);
+            cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
+
+            // Splat computes each voxel's coverage from scratch and writes it unconditionally, so
+            // it IS the clear when it runs — a preceding Clear only pays a second full-volume pass
+            // to write zeroes that Splat immediately overwrites. And with no shapes at all (the
+            // normal case once mesh voxelization handles everything) Splat itself is 663k threads
+            // whose entire job is to store 0, which Clear already does more cheaply. So: exactly
+            // one of the two runs, never both.
+            bool hasShapes = _sphereCount > 0 || _boxCount > 0;
+
+            if (!hasShapes)
+            {
+                using (_profiler.Sample(cmd, "Clear"))
+                {
+                    cmd.SetComputeTextureParam(Occlusion, _clearKernel, IdCOcc, _volume);
+                    cmd.DispatchCompute(Occlusion, _clearKernel, gx, gy, gz);
+                }
+                return;
+            }
+
             if (_sphereBuffer == null || _sphereBuffer.count != _spheres.Length)
             {
                 _sphereBuffer?.Dispose();
@@ -874,27 +905,19 @@ namespace Origuma.StageBeam
             }
             cmd.SetBufferData(_boxBuffer, _boxes);
 
-            var res = Resolution;
-            int gx = Mathf.CeilToInt(res.x / 4f);
-            int gy = Mathf.CeilToInt(res.y / 4f);
-            int gz = Mathf.CeilToInt(res.z / 4f);
-
-            // Clear
-            cmd.SetComputeTextureParam(Occlusion, _clearKernel, IdCOcc, _volume);
-            cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
-            cmd.DispatchCompute(Occlusion, _clearKernel, gx, gy, gz);
-
-            // Splat
-            var min = _wc - _ws * 0.5f;
-            cmd.SetComputeTextureParam(Occlusion, _splatKernel, IdCOcc, _volume);
-            cmd.SetComputeBufferParam(Occlusion, _splatKernel, IdCSpheres, _sphereBuffer);
-            cmd.SetComputeIntParam(Occlusion, IdCCount, _sphereCount);
-            cmd.SetComputeBufferParam(Occlusion, _splatKernel, IdCBoxes, _boxBuffer);
-            cmd.SetComputeIntParam(Occlusion, IdCBoxCount, _boxCount);
-            cmd.SetComputeVectorParam(Occlusion, IdCVolMin, min);
-            cmd.SetComputeVectorParam(Occlusion, IdCVolSize, _ws);
-            cmd.SetComputeFloatParam(Occlusion, IdCSoft, EdgeSoftness);
-            cmd.DispatchCompute(Occlusion, _splatKernel, gx, gy, gz);
+            using (_profiler.Sample(cmd, "Splat"))
+            {
+                var min = _wc - _ws * 0.5f;
+                cmd.SetComputeTextureParam(Occlusion, _splatKernel, IdCOcc, _volume);
+                cmd.SetComputeBufferParam(Occlusion, _splatKernel, IdCSpheres, _sphereBuffer);
+                cmd.SetComputeIntParam(Occlusion, IdCCount, _sphereCount);
+                cmd.SetComputeBufferParam(Occlusion, _splatKernel, IdCBoxes, _boxBuffer);
+                cmd.SetComputeIntParam(Occlusion, IdCBoxCount, _boxCount);
+                cmd.SetComputeVectorParam(Occlusion, IdCVolMin, min);
+                cmd.SetComputeVectorParam(Occlusion, IdCVolSize, _ws);
+                cmd.SetComputeFloatParam(Occlusion, IdCSoft, EdgeSoftness);
+                cmd.DispatchCompute(Occlusion, _splatKernel, gx, gy, gz);
+            }
         }
 
         private static readonly int IdVoxTargetRT   = Shader.PropertyToID("_StageBeamVoxelizeRT");
@@ -926,6 +949,7 @@ namespace Origuma.StageBeam
 
             if (!ComputeSkinnedVoxelize || _triKernel < 0 || target == null) return;
 
+            using var _sk = _profiler.Sample(cmd, "SkinnedCompute");
             bool boundVolume = false;
             for (int i = 0; i < _occluders.Count; i++)
             {
@@ -1050,6 +1074,8 @@ namespace Origuma.StageBeam
 
             ClassifyAndFlag();
 
+            using var _vox = _profiler.Sample(cmd, "VoxelizeMeshes");
+
             // Skinned renderers go through the compute path first (zero draw calls); whatever it
             // marks as handled, the raster axes below skip. Skinned occupancy is always dynamic,
             // so it writes _volume — cleared by RecordUploadAndDispatch — in both split modes.
@@ -1167,6 +1193,7 @@ namespace Origuma.StageBeam
 
         private void DispatchClear(CommandBuffer cmd, RenderTexture vol)
         {
+            using var _s = _profiler.Sample(cmd, "ClearStatic");
             var res = Resolution;
             cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
             cmd.SetComputeTextureParam(Occlusion, _clearKernel, IdCOcc, vol);
@@ -1176,6 +1203,7 @@ namespace Origuma.StageBeam
 
         private void DispatchCombine(CommandBuffer cmd, RenderTexture target, RenderTexture other)
         {
+            using var _s = _profiler.Sample(cmd, "CombineMax");
             var res = Resolution;
             cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
             cmd.SetComputeTextureParam(Occlusion, _combineKernel, IdCOcc, target);
@@ -1257,10 +1285,18 @@ namespace Origuma.StageBeam
             cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
 
             // 2× GrowMax (fill/thicken) then 2× blur (smooth) — ping-pong, ends in _volume.
-            Pass(cmd, _growKernel >= 0 ? _growKernel : _dilateKernel, _volume, _volumeTemp, gx, gy, gz);
-            Pass(cmd, _growKernel >= 0 ? _growKernel : _dilateKernel, _volumeTemp, _volume, gx, gy, gz);
-            Pass(cmd, _dilateKernel, _volume, _volumeTemp, gx, gy, gz);
-            Pass(cmd, _dilateKernel, _volumeTemp, _volume, gx, gy, gz);
+            // Timed separately: they are four full-volume passes and the likeliest place left to
+            // find real time, so "grow" and "blur" must be distinguishable in the report.
+            using (_profiler.Sample(cmd, "GrowMax x2"))
+            {
+                Pass(cmd, _growKernel >= 0 ? _growKernel : _dilateKernel, _volume, _volumeTemp, gx, gy, gz);
+                Pass(cmd, _growKernel >= 0 ? _growKernel : _dilateKernel, _volumeTemp, _volume, gx, gy, gz);
+            }
+            using (_profiler.Sample(cmd, "Blur x2"))
+            {
+                Pass(cmd, _dilateKernel, _volume, _volumeTemp, gx, gy, gz);
+                Pass(cmd, _dilateKernel, _volumeTemp, _volume, gx, gy, gz);
+            }
         }
 
         private void Pass(CommandBuffer cmd, int kernel, RenderTexture src, RenderTexture dst,
@@ -1305,11 +1341,14 @@ namespace Origuma.StageBeam
             float alpha = reAnchored ? 1f : Mathf.Clamp01(1f - TemporalSmoothing);
             var res = Resolution;
             int gx = Mathf.CeilToInt(res.x / 4f), gy = Mathf.CeilToInt(res.y / 4f), gz = Mathf.CeilToInt(res.z / 4f);
-            cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
-            cmd.SetComputeFloatParam(Occlusion, IdCTemporalAlpha, alpha);
-            cmd.SetComputeTextureParam(Occlusion, _temporalKernel, IdCCurrent, _volume);
-            cmd.SetComputeTextureParam(Occlusion, _temporalKernel, IdCOcc, _volumeHistory);
-            cmd.DispatchCompute(Occlusion, _temporalKernel, gx, gy, gz);
+            using (_profiler.Sample(cmd, "Temporal"))
+            {
+                cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
+                cmd.SetComputeFloatParam(Occlusion, IdCTemporalAlpha, alpha);
+                cmd.SetComputeTextureParam(Occlusion, _temporalKernel, IdCCurrent, _volume);
+                cmd.SetComputeTextureParam(Occlusion, _temporalKernel, IdCOcc, _volumeHistory);
+                cmd.DispatchCompute(Occlusion, _temporalKernel, gx, gy, gz);
+            }
             return _volumeHistory;
         }
 

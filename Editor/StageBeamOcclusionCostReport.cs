@@ -46,7 +46,36 @@ namespace Origuma.StageBeam.Editor
                 "  Reading Δ: ~1e-6..1e-4 = micro-jitter (near-invisible at centimetre voxels); " +
                 "large Δ = real motion. Draw calls remaining here are non-skinned dynamic meshes " +
                 "plus static rebuilds; each carries its own SetPass, which is what the Statistics " +
-                "panel loses when the Frame Debugger pauses the game.");
+                "panel loses when the Frame Debugger pauses the game.\n" +
+                GpuTimings(b));
+        }
+
+        /// <summary>
+        /// GPU time per pass, or an invitation to turn it on. Counting stopped being informative
+        /// once the draw calls went away: the remaining work is full-volume compute passes whose
+        /// invocation count is identical whether or not they accomplish anything, so only time
+        /// separates the passes worth cutting from the ones already free.
+        /// </summary>
+        private static string GpuTimings(StageBeamOcclusionBuilder b)
+        {
+            if (!StageBeamOcclusionProfiler.Enabled)
+                return "  gpu timing           : off — Window > Origuma > Stage Beam > " +
+                       "Toggle Occlusion GPU Profiling";
+
+            var p = b.Profiler;
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"  gpu timing           : {p.TotalMs:0.000} ms total");
+            foreach (var name in p.PassOrder)
+                sb.Append($"\n      {name,-16} {p.GetMs(name):0.000} ms");
+            return sb.ToString();
+        }
+
+        [MenuItem("Window/Origuma/Stage Beam/Toggle Occlusion GPU Profiling", false, 202)]
+        private static void ToggleProfiling()
+        {
+            StageBeamOcclusionProfiler.Enabled = !StageBeamOcclusionProfiler.Enabled;
+            Debug.Log($"<color=#5aa9e6>[StageBeam]</color> Occlusion GPU profiling " +
+                      $"{(StageBeamOcclusionProfiler.Enabled ? "ON — readings appear after a few builds" : "OFF")}.");
         }
 
         /// <summary>
