@@ -156,10 +156,20 @@ namespace Origuma.StageBeam
         /// Renderer.name allocates).</summary>
         public Renderer LastMaxMovedRenderer => _statMaxMovedRenderer;
 
-        private int _statDraws, _statOccluders, _statDynamic;
+        /// <summary>Dynamic occluders that are skinned — MEASURED in the loop, not derived by
+        /// subtraction (a derived "skinned" figure once mislabelled 400 fixture meshes).</summary>
+        public int LastDynamicSkinned => _statDynSkinned;
+        /// <summary>Classification runs / movement-cache allocations since this builder was
+        /// created. Allocations tracking builds one-to-one means the cache is lost every build —
+        /// the smoking gun for "everything reads as moved".</summary>
+        public int TotalBuilds => _statBuilds;
+        public int TotalMatrixAllocs => _statMatrixAllocs;
+
+        private int _statDraws, _statOccluders, _statDynamic, _statDynSkinned;
         private int _statHints, _statHintCovered;
         private int _statBuildFrame = -1;
         private int _statMovedMeshes;
+        private int _statBuilds, _statMatrixAllocs;
         private float _statMaxMovedDelta;
         private Renderer _statMaxMovedRenderer;
         private bool _statMatrixReset;
@@ -904,6 +914,20 @@ namespace Origuma.StageBeam
             int n = _occluders.Count;
             if (_voxelizeFlags == null || _voxelizeFlags.Length < n) _voxelizeFlags = new bool[Mathf.Max(n, 8)];
 
+            _statBuilds++;
+            // Stats are reset BEFORE the classification below computes them. An earlier revision
+            // reset _statMatrixReset here, AFTER the doSplit block had already recorded it — so
+            // the report unconditionally printed "reset: no" and hid the very condition it was
+            // added to reveal.
+            _staticDirty = false;
+            _statOccluders = 0;
+            _statDynamic = 0;
+            _statDynSkinned = 0;
+            _statMatrixReset = false;
+            _statMovedMeshes = 0;
+            _statMaxMovedDelta = 0f;
+            _statMaxMovedRenderer = null;
+
             bool doSplit = StaticDynamicSplit;
             bool matricesReset = false;   // first build (or post-rescan) → treat every occluder as moved
             if (doSplit)
@@ -914,17 +938,13 @@ namespace Origuma.StageBeam
                     _wasDynamic  = new bool[Mathf.Max(n, 8)];
                 }
                 matricesReset = _lastMatrices == null || _lastMatrices.Length < n;
-                if (matricesReset) _lastMatrices = new Matrix4x4[Mathf.Max(n, 8)];
+                if (matricesReset)
+                {
+                    _lastMatrices = new Matrix4x4[Mathf.Max(n, 8)];
+                    _statMatrixAllocs++;
+                }
                 _statMatrixReset = matricesReset;
             }
-
-            _staticDirty = false;
-            _statOccluders = 0;
-            _statDynamic = 0;
-            _statMatrixReset = false;
-            _statMovedMeshes = 0;
-            _statMaxMovedDelta = 0f;
-            _statMaxMovedRenderer = null;
             for (var i = 0; i < n; i++)
             {
                 var r = _occluders[i];
@@ -953,7 +973,11 @@ namespace Origuma.StageBeam
                 if (dyn != _wasDynamic[i]) _staticDirty = true;
                 _dynamicFlags[i] = dyn;
                 _wasDynamic[i]   = dyn;
-                if (dyn && _voxelizeFlags[i]) _statDynamic++;
+                if (dyn && _voxelizeFlags[i])
+                {
+                    _statDynamic++;
+                    if (r is SkinnedMeshRenderer) _statDynSkinned++;
+                }
             }
         }
 
