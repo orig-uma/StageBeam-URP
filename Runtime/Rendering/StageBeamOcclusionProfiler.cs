@@ -25,8 +25,28 @@ namespace Origuma.StageBeam
     public sealed class StageBeamOcclusionProfiler
     {
         /// <summary>Per-pass GPU timing. Off by default — enable from the Renderer Feature (or the
-        /// cost report menu) while investigating.</summary>
-        public static bool Enabled;
+        /// cost report menu) while investigating. Toggling ON arms the recorders of every sampler
+        /// created so far, so a session that profiled, stopped and resumed keeps working.</summary>
+        public static bool Enabled
+        {
+            get => s_enabled;
+            set
+            {
+                if (s_enabled == value) return;
+                s_enabled = value;
+                for (int i = 0; i < s_all.Count; i++) s_all[i].ArmRecorders(value);
+            }
+        }
+        private static bool s_enabled;
+        private static readonly List<StageBeamOcclusionProfiler> s_all =
+            new List<StageBeamOcclusionProfiler>(4);
+
+        public StageBeamOcclusionProfiler() => s_all.Add(this);
+
+        private void ArmRecorders(bool on)
+        {
+            foreach (var kv in _samplers) kv.Value.enableRecording = on;
+        }
 
         // ProfilingSampler carries the GPU recorder Unity fills in; one per pass name, created on
         // demand and kept for the session (they are cheap and must outlive the frames they time).
@@ -49,11 +69,18 @@ namespace Origuma.StageBeam
             if (!_samplers.TryGetValue(passName, out var sampler))
             {
                 sampler = new ProfilingSampler("StageBeamOcc." + passName);
+                // Without this the sampler still shows up in the Profiler window but its recorder
+                // stays disabled, and gpuElapsedTime reads a flat 0.00 — which looks exactly like
+                // "this pass is free" rather than "nothing was measured".
+                sampler.enableRecording = true;
                 _samplers[passName] = sampler;
                 _order.Add(passName);
             }
-            cmd.BeginSample(sampler.name);
-            return new Scope(cmd, sampler.name);
+            // Begin with the SAMPLER, not its name: that is what ties the command buffer's GPU
+            // timing to this sampler's recorder. A name-based BeginSample opens an unrelated
+            // sampler whose timings this object can never read back.
+            cmd.BeginSample(sampler.sampler);
+            return new Scope(cmd, sampler.sampler);
         }
 
         /// <summary>Reads back whatever the recorders have and refreshes the reported times.
@@ -63,10 +90,12 @@ namespace Origuma.StageBeam
             if (!Enabled) return;
             foreach (var kv in _samplers)
             {
-                var rec = kv.Value.gpuElapsedTime;
+                // Already MILLISECONDS — ProfilingSampler.gpuElapsedTime does the nanosecond
+                // conversion itself. Scaling it again reported microseconds as milliseconds.
+                float ms = kv.Value.gpuElapsedTime;
                 // A recorder with no completed sample reports 0 — keep the previous reading so a
                 // pass that ran a frame ago doesn't flicker to zero in the report.
-                if (rec > 0.0) _lastMs[kv.Key] = rec * 1000.0;
+                if (ms > 0f) _lastMs[kv.Key] = ms;
             }
         }
 
@@ -86,9 +115,16 @@ namespace Origuma.StageBeam
         public readonly struct Scope : System.IDisposable
         {
             private readonly CommandBuffer _cmd;
-            private readonly string _name;
-            internal Scope(CommandBuffer cmd, string name) { _cmd = cmd; _name = name; }
-            public void Dispose() { if (_cmd != null) _cmd.EndSample(_name); }
+            private readonly CustomSampler _sampler;
+            internal Scope(CommandBuffer cmd, CustomSampler sampler)
+            {
+                _cmd = cmd;
+                _sampler = sampler;
+            }
+            public void Dispose()
+            {
+                if (_cmd != null && _sampler != null) _cmd.EndSample(_sampler);
+            }
         }
     }
 }
