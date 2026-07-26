@@ -27,32 +27,26 @@ namespace Origuma.StageBeam.Editor
             }
 
             int draws = b.LastVoxelizeDrawCalls;
-            // The last two lines discriminate look-alike root causes behind "everything dynamic,
-            // static rebuilt every build":
-            //   matrix cache reset = yes on every sample -> the movement cache is wiped between
-            //     builds (builder recreated / arrays resized): an accounting bug, fixable for free.
-            //   matrix cache reset = no                  -> the occluders genuinely move; the
-            //     classification is right and the cost is real (levers: instancing, fewer axes).
-            //   builder instance changing between samples -> something recreates the builder.
             Debug.Log(
-                $"<color=#5aa9e6>[StageBeam]</color> Occlusion build — <b>{draws} voxelize draw calls</b>\n" +
-                $"  occluders rasterized : {b.LastVoxelizedOccluders} of {b.OccluderCount} collected\n" +
-                $"  treated as dynamic   : {b.LastDynamicOccluders}\n" +
+                $"<color=#5aa9e6>[StageBeam]</color> Occlusion build — <b>{draws} voxelize draw calls</b>, " +
+                $"<b>{b.LastComputeSkinned} skinned via compute (0 draws)</b>\n" +
+                $"  occluders rasterized : {b.LastVoxelizedOccluders} of {b.OccluderCount} collected " +
+                $"(compute-handled ones no longer draw)\n" +
+                $"  treated as dynamic   : {b.LastDynamicOccluders} " +
+                $"({b.LastDynamicSkinned} skinned, {b.LastMovedMeshCount} moved mesh(es), " +
+                $"largest move Δ{b.LastMaxMovedDelta:g3}" +
+                $"{(b.LastMaxMovedRenderer != null ? $" on '{b.LastMaxMovedRenderer.name}'" : "")})\n" +
                 $"  static volume rebuilt: {(b.LastRebuiltStatic ? "YES (the expensive case)" : "no (cached)")}\n" +
                 $"  sphere / box splats  : {b.SphereCount} / {b.BoxCount}\n" +
                 $"  occluder hints       : {b.HintCount} found, covering {b.HintCoveredOccluders} renderer(s)\n" +
-                $"  matrix cache reset   : {(b.LastMatrixCacheReset ? "YES (movement compare had no history)" : "no")}, " +
-                $"{b.TotalMatrixAllocs} alloc(s) over {b.TotalBuilds} build(s)\n" +
+                $"  movement history     : {b.MovementHistoryCount} renderer(s) tracked" +
+                $"{(b.LastMatrixCacheReset ? " (EMPTY at last build — first build only)" : "")}, " +
+                $"{b.TotalBuilds} build(s)\n" +
                 $"  builder instance     : #{b.GetHashCode():x8}, built at frame {b.LastBuildFrame} (now {Time.frameCount})\n" +
-                $"  dynamic breakdown    : {b.LastDynamicSkinned} skinned (measured), " +
-                $"{b.LastMovedMeshCount} moved mesh(es), largest move Δ{b.LastMaxMovedDelta:g3}" +
-                $"{(b.LastMaxMovedRenderer != null ? $" on '{b.LastMaxMovedRenderer.name}'" : "")}\n" +
-                "  Reading it: allocs tracking builds 1:1 = the movement cache is lost every build " +
-                "(everything reads as moved; find who wipes it). Δ ~1e-6..1e-4 = micro-jitter (an " +
-                "epsilon returns those to the static cache; a voxel is centimetres). Large Δ = real " +
-                "motion; the lever is instancing.\n" +
-                "  Each draw call carries its own SetPass, so this is what the Statistics panel " +
-                "loses when the Frame Debugger pauses the game.");
+                "  Reading Δ: ~1e-6..1e-4 = micro-jitter (near-invisible at centimetre voxels); " +
+                "large Δ = real motion. Draw calls remaining here are non-skinned dynamic meshes " +
+                "plus static rebuilds; each carries its own SetPass, which is what the Statistics " +
+                "panel loses when the Frame Debugger pauses the game.");
         }
 
         /// <summary>

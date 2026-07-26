@@ -118,7 +118,7 @@ UV がフル/半解像度どちらでも正しくなるようにしている。
 
 `StageBeamOcclusionBuilder` が毎フレーム実行する GPU パイプライン:
 
-1. **発見**: レイヤーマスクで Renderer を列挙(`RescanInterval`=0.25s 間隔、
+1. **発見**: レイヤーマスクで Renderer を列挙(`RescanInterval`=1s 間隔、
    edit mode 対応のため `realtimeSinceStartup` 基準)。ParticleSystemRenderer と
    `MaxOccluderSize` 超は除外。
 2. **発見の非アクティブ対応**: レイヤーマスクの Renderer 列挙は**非アクティブも含めて**
@@ -128,6 +128,13 @@ UV がフル/半解像度どちらでも正しくなるようにしている。
    `StageBeamVoxelize.shader` で3軸(X/Y/Z)から直交投影ラスタライズし、各フラグメントが
    自分のワールド座標のボクセルへ UAV 書き込み(`RWTexture3D`)。シルエットが
    スキニング済みポーズ・布変形込みの実ジオメトリになる。
+   - **スキンドは compute 経由(既定 `ComputeSkinnedVoxelize`)**: GPU スキニング済みの
+     頂点バッファ(`SkinnedMeshRenderer.GetVertexBuffer`)を `VoxelizeTriangles` カーネルが
+     直接読み、三角形表面を ~2 サンプル/ボクセルで打点して同じ volume に書く。
+     **ドローコール 0**(ラスタ経路は Renderer 数 × 軸数のドロー+SetPass)、しかも
+     3D サンプリングなので軸の掛け算も無い。ジオメトリは同一なので影も同一。
+     スキンドバッファが取れない場合(GPU スキニング無効など)はその Renderer だけ
+     従来のラスタにフォールバック。
    - **フォールバック(`MeshVoxelize` off)**: 通常 Renderer は `localBounds` から
      有向ボックス、SkinnedMeshRenderer は骨格に球チェーンを配置(`BonesPerOccluder`)。
      旧来の近似で、低スペック向け。

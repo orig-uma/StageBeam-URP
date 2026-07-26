@@ -72,6 +72,10 @@ namespace Origuma.StageBeam
         [Tooltip("Mesh-voxelization passes (X/Y/Z). 3 = fully conservative; 2 drops the top-down " +
                  "pass for a cheaper occlusion build (recorded draw count scales with this).")]
         [Range(1, 3)] public int VoxelizeAxisCount = 3;
+        [Tooltip("Voxelize skinned occluders by COMPUTE instead of rasterization: same geometry, " +
+                 "same shadow, zero draw calls. Needs GPU skinning; unavailable buffers fall back " +
+                 "to raster per renderer.")]
+        public bool ComputeSkinnedVoxelize = true;
         [Tooltip("Static/dynamic split (perf): voxelize non-moving occluders once (cached), " +
                  "re-voxelize only dynamic ones each build. Automatic classification. MeshVoxelize only.")]
         public bool StaticDynamicSplit;
@@ -153,6 +157,7 @@ namespace Origuma.StageBeam
             b.OccluderMask           = OccluderMask;
             b.MeshVoxelize           = MeshVoxelize;
             b.VoxelizeAxisCount      = VoxelizeAxisCount;
+            b.ComputeSkinnedVoxelize = ComputeSkinnedVoxelize;
             b.StaticDynamicSplit     = StaticDynamicSplit;
             b.RescanInterval         = RescanInterval;
             b.ArticulateSkinnedMeshes = ArticulateSkinnedMeshes;

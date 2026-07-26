@@ -105,8 +105,11 @@ Feature set **Shadows**:
   cloth deformation included — at voxel resolution (~3–4 cm at the default fit), then softly
   dilated so the shadow march can't miss thin features. No spheres, no capsules, no per-object
   setup. (Mesh Voxelize off = legacy sphere/box approximation, cheaper on very weak GPUs.)
-  Accuracy has a price: rasterizing costs one draw call **per renderer per axis**, so a scene of
-  animated characters runs into the hundreds — see the Occluder Hint note below for the lever.
+  **Skinned occluders go through a compute path by default** (`Compute Skinned Voxelize`):
+  their GPU-skinned vertex buffers are voxelized directly — identical geometry, identical
+  shadow, **zero draw calls**, where rasterizing costs one draw call (its own SetPass) per
+  renderer per axis and a cast of performers runs into the hundreds. Needs GPU skinning;
+  renderers without an accessible skinned buffer fall back to rasterization automatically.
   Occluders on the feature's **Occluder Mask** layers are discovered every frame and voxelized
   once per frame; the cost is independent of the number of beams. Static meshes become oriented
   boxes straight from their renderer bounds (no setup needed — walls, risers, panels and cases

@@ -159,6 +159,11 @@ namespace Origuma.StageBeam
                  "count scales with this) and usually enough for upright performers. Lower if the " +
                  "build's CPU cost matters more than catching perfectly horizontal surfaces.")]
         [Range(1, 3)] [SerializeField] private int _volVoxelizeAxes = 3;
+        [Tooltip("Voxelize skinned occluders by COMPUTE instead of rasterization: same geometry, " +
+                 "same shadow, zero draw calls (the raster path costs one draw + SetPass per " +
+                 "renderer per axis — a cast of performers is hundreds per build). Needs GPU " +
+                 "skinning; renderers whose skinned buffer is unavailable fall back to raster.")]
+        [SerializeField] private bool _volComputeSkinned = true;
         [Tooltip("Static/dynamic occluder split (perf). Voxelizes non-moving rigid occluders once " +
                  "into a cached volume and re-voxelizes only dynamic ones (skinned performers + " +
                  "anything that moved) each build — killing the per-build draw spike from static " +
@@ -432,10 +437,11 @@ namespace Origuma.StageBeam
         // box, then lets these drive the shadow behaviour).
         private void ApplyFeatureOcclusionSettings(StageBeamOcclusionBuilder b)
         {
-            b.OccluderMask       = _occluderMask;
-            b.MeshVoxelize       = _volMeshVoxelize;
-            b.VoxelizeAxisCount  = _volVoxelizeAxes;
-            b.StaticDynamicSplit = _volStaticDynamicSplit;
+            b.OccluderMask           = _occluderMask;
+            b.MeshVoxelize           = _volMeshVoxelize;
+            b.VoxelizeAxisCount      = _volVoxelizeAxes;
+            b.ComputeSkinnedVoxelize = _volComputeSkinned;
+            b.StaticDynamicSplit     = _volStaticDynamicSplit;
             b.Strength           = _volStrength;
             b.ShadowDensity      = _volDensity;
             b.ShadowSteps        = _volSteps;
