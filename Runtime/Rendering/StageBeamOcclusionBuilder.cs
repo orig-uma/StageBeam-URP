@@ -876,7 +876,16 @@ namespace Origuma.StageBeam
             int gx = Mathf.CeilToInt(res.x / 4f);
             int gy = Mathf.CeilToInt(res.y / 4f);
             int gz = Mathf.CeilToInt(res.z / 4f);
+
+            // The volume's world placement, bound UNCONDITIONALLY. It describes the grid itself,
+            // not the shape splat, and the triangle voxelizer reads it to map world positions into
+            // voxels. It used to live inside the Splat block, which was harmless only because
+            // Splat always ran; once Splat became conditional (skipped when there are no shapes —
+            // the normal case) the values went stale, the voxelizer kept writing against an older
+            // box, and every shadow sat at a fixed offset from its caster.
             cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
+            cmd.SetComputeVectorParam(Occlusion, IdCVolMin, _wc - _ws * 0.5f);
+            cmd.SetComputeVectorParam(Occlusion, IdCVolSize, _ws);
 
             // Splat computes each voxel's coverage from scratch and writes it unconditionally, so
             // it IS the clear when it runs — a preceding Clear only pays a second full-volume pass
@@ -912,14 +921,12 @@ namespace Origuma.StageBeam
 
             using (_profiler.Sample(cmd, "Splat"))
             {
-                var min = _wc - _ws * 0.5f;
+                // _VolMin / _VolSize are bound above, for every path.
                 cmd.SetComputeTextureParam(Occlusion, _splatKernel, IdCOcc, _volume);
                 cmd.SetComputeBufferParam(Occlusion, _splatKernel, IdCSpheres, _sphereBuffer);
                 cmd.SetComputeIntParam(Occlusion, IdCCount, _sphereCount);
                 cmd.SetComputeBufferParam(Occlusion, _splatKernel, IdCBoxes, _boxBuffer);
                 cmd.SetComputeIntParam(Occlusion, IdCBoxCount, _boxCount);
-                cmd.SetComputeVectorParam(Occlusion, IdCVolMin, min);
-                cmd.SetComputeVectorParam(Occlusion, IdCVolSize, _ws);
                 cmd.SetComputeFloatParam(Occlusion, IdCSoft, EdgeSoftness);
                 cmd.DispatchCompute(Occlusion, _splatKernel, gx, gy, gz);
             }
