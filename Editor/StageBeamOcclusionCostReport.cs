@@ -30,6 +30,8 @@ namespace Origuma.StageBeam.Editor
             Debug.Log(
                 $"<color=#5aa9e6>[StageBeam]</color> Occlusion build — <b>{draws} voxelize draw calls</b>, " +
                 $"<b>{b.LastComputeSkinned} skinned via compute (0 draws)</b>\n" +
+                $"  skinned compute      : {b.LastSkinnedDispatches} dispatch(es), " +
+                $"{b.LastSkinnedTriangles} triangle(s)\n" +
                 $"  occluders rasterized : {b.LastVoxelizedOccluders} of {b.OccluderCount} collected " +
                 $"(compute-handled ones no longer draw)\n" +
                 $"  treated as dynamic   : {b.LastDynamicOccluders} " +

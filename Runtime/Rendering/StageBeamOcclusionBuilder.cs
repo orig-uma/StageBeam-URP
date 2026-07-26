@@ -173,6 +173,11 @@ namespace Origuma.StageBeam
         /// <summary>Skinned renderers voxelized by the compute path last build — each of these
         /// would otherwise have cost one draw call (its own SetPass) per axis.</summary>
         public int LastComputeSkinned => _statComputeSkinned;
+        /// <summary>Compute dispatches and triangles the skinned voxelizer issued last build.
+        /// Time divided by dispatches tells you whether the pass is overhead-bound (a roughly
+        /// fixed microsecond cost per call, unmoved by triangle count) or work-bound.</summary>
+        public int LastSkinnedDispatches => _statSkinnedDispatches;
+        public int LastSkinnedTriangles => _statSkinnedTris;
 
         /// <summary>Per-pass GPU timing (opt-in via StageBeamOcclusionProfiler.Enabled). With the
         /// draw calls gone, time is the only way to tell which of the full-volume compute passes
@@ -251,7 +256,7 @@ namespace Origuma.StageBeam
         // Occluders handled by the compute path this build (parallel to _occluders); the raster
         // axes skip these.
         private bool[] _computeHandled;
-        private int _statComputeSkinned;
+        private int _statComputeSkinned, _statSkinnedDispatches, _statSkinnedTris;
         private bool _warnedNoSkinBuffer;
         private RenderTexture _volumeTemp;      // ping-pong for the dilate passes
         private RenderTexture _volumeHistory;   // temporal EMA of the occupancy (bound for shadowing)
@@ -946,6 +951,8 @@ namespace Origuma.StageBeam
                 _computeHandled = new bool[Mathf.Max(_occluders.Count, 8)];
             System.Array.Clear(_computeHandled, 0, _computeHandled.Length);
             _statComputeSkinned = 0;
+            _statSkinnedDispatches = 0;
+            _statSkinnedTris = 0;
 
             if (!ComputeSkinnedVoxelize || _triKernel < 0 || target == null) return;
 
@@ -1024,20 +1031,57 @@ namespace Origuma.StageBeam
                 cmd.SetComputeMatrixParam(Occlusion, IdTriLocalToWorld,
                     skinRoot.localToWorldMatrix);
 
+                // Submeshes are contiguous ranges of one index buffer, so when they all share a
+                // baseVertex (the overwhelmingly common case) the whole renderer is ONE range and
+                // one dispatch. Occupancy does not care which material a triangle belongs to, and
+                // dispatch overhead is per-call — with ~90 skinned renderers, dispatching per
+                // submesh instead multiplies a fixed cost by the material count for no benefit.
+                int spanStart = int.MaxValue, spanEnd = 0, spanBase = 0, spanTris = 0;
+                bool uniformBase = true, anyTris = false;
                 for (int sm = 0; sm < mesh.subMeshCount; sm++)
                 {
-                    var desc = mesh.GetSubMesh(sm);
-                    if (desc.topology != MeshTopology.Triangles || desc.indexCount < 3) continue;
-                    cmd.SetComputeIntParam(Occlusion, IdTriIndexStart, desc.indexStart);
-                    cmd.SetComputeIntParam(Occlusion, IdTriIndexCount, desc.indexCount);
-                    cmd.SetComputeIntParam(Occlusion, IdTriBaseVertex, desc.baseVertex);
-                    cmd.DispatchCompute(Occlusion, _triKernel,
-                        Mathf.CeilToInt(desc.indexCount / 3f / 64f), 1, 1);
+                    var d = mesh.GetSubMesh(sm);
+                    if (d.topology != MeshTopology.Triangles || d.indexCount < 3) continue;
+                    if (!anyTris) { spanBase = d.baseVertex; anyTris = true; }
+                    else if (d.baseVertex != spanBase) { uniformBase = false; }
+                    spanStart = Mathf.Min(spanStart, d.indexStart);
+                    spanEnd = Mathf.Max(spanEnd, d.indexStart + d.indexCount);
+                    spanTris += d.indexCount / 3;
+                }
+                if (!anyTris) continue;
+
+                if (uniformBase)
+                {
+                    Dispatch(cmd, spanStart, spanEnd - spanStart, spanBase);
+                }
+                else
+                {
+                    // Mixed baseVertex: each range needs its own offset, so fall back to per-submesh.
+                    for (int sm = 0; sm < mesh.subMeshCount; sm++)
+                    {
+                        var d = mesh.GetSubMesh(sm);
+                        if (d.topology != MeshTopology.Triangles || d.indexCount < 3) continue;
+                        Dispatch(cmd, d.indexStart, d.indexCount, d.baseVertex);
+                    }
                 }
 
                 _computeHandled[i] = true;
                 _statComputeSkinned++;
+                _statSkinnedTris += spanTris;
             }
+        }
+
+        // One triangle-voxelize dispatch over an index range. Counted so the report can tell
+        // dispatch-overhead-bound from triangle-work-bound: those need opposite fixes (fewer
+        // dispatches vs. fewer samples per triangle), and the totals alone cannot distinguish them.
+        private void Dispatch(CommandBuffer cmd, int indexStart, int indexCount, int baseVertex)
+        {
+            cmd.SetComputeIntParam(Occlusion, IdTriIndexStart, indexStart);
+            cmd.SetComputeIntParam(Occlusion, IdTriIndexCount, indexCount);
+            cmd.SetComputeIntParam(Occlusion, IdTriBaseVertex, baseVertex);
+            cmd.DispatchCompute(Occlusion, _triKernel,
+                Mathf.CeilToInt(indexCount / 3f / 64f), 1, 1);
+            _statSkinnedDispatches++;
         }
 
         private void RecordVoxelizeMeshes(CommandBuffer cmd)
@@ -1074,12 +1118,14 @@ namespace Origuma.StageBeam
 
             ClassifyAndFlag();
 
-            using var _vox = _profiler.Sample(cmd, "VoxelizeMeshes");
-
             // Skinned renderers go through the compute path first (zero draw calls); whatever it
             // marks as handled, the raster axes below skip. Skinned occupancy is always dynamic,
             // so it writes _volume — cleared by RecordUploadAndDispatch — in both split modes.
             RecordComputeSkinned(cmd, _volume);
+
+            // Timed separately from SkinnedCompute, not around it: a scope that CONTAINS another
+            // double-counts in the report's total and hides which of the two costs anything.
+            using var _raster = _profiler.Sample(cmd, "RasterVoxelize");
 
             bool split = StaticDynamicSplit && _combineKernel >= 0 && _clearKernel >= 0 && EnsureStaticVolume();
             if (split)
