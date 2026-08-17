@@ -55,23 +55,38 @@ namespace Origuma.StageBeam
     {
         [SerializeField] private RenderPassEvent _event = RenderPassEvent.AfterRenderingTransparents;
 
-        [Tooltip("Render beams into a downscaled target and upsample — the biggest fill-rate lever " +
-                 "when beams cover the screen. Raymarch pixels: Half = 1/4, Third = 1/9, " +
-                 "Quarter = 1/16. Third sits between Half and Quarter: reach for it when Quarter " +
-                 "bands/moires at high output resolutions but Half costs too much. Beams soften " +
-                 "slightly (depth-aware upsample keeps object edges clean).")]
-        [SerializeField] private ResolutionScale _resolutionScale = ResolutionScale.Quarter;
+        [Tooltip("Beam buffer size as a fraction of the screen, per axis — the biggest fill-rate " +
+                 "lever when beams cover the screen. Cost scales with the SQUARE: 0.75 raymarches " +
+                 "56% of the pixels, 0.5 = 25%, 0.33 = 11%. 1 = sharpest gobo/prism shafts; " +
+                 "lower softens them and eventually moires. Try raising Raymarch Steps before " +
+                 "dropping below 0.5, and measure first — a beam-heavy scene is often limited " +
+                 "by something other than the beams.")]
+        [Range(0.25f, 1f)] [SerializeField] private float _resolutionFactor = 0.5f;
+
+        // Legacy preset dropdown, kept only to migrate old assets into _resolutionFactor (see
+        // Create()). The float slider replaced it because the useful setting turned out to sit
+        // BETWEEN the presets (0.7-0.8 for shaft detail at reasonable cost).
+        [SerializeField, HideInInspector] private ResolutionScale _resolutionScale = ResolutionScale.Half;
+        [SerializeField, HideInInspector] private bool _resolutionFactorMigrated = false;
 
         [Tooltip("Depth-aware smoothing of the beam buffer before compositing. Averages away " +
                  "the raymarch/shadow jitter grain — most visible in shadowed regions at Half/" +
                  "Quarter resolution — at the cost of a slightly softer fog. Near-free.")]
         [SerializeField] private bool _noiseSmoothing = true;
 
-        [Tooltip("Anti-banding dither applied when the beam is composited into the camera target, " +
-                 "as a fraction of each pixel's value. Beams are wide, smooth, low-slope ramps — " +
-                 "exactly what quantizes into Mach bands in the camera's low-mantissa HDR format " +
-                 "(B10G11R11, 32-bit HDR). Raise until the contours break up; lower if it reads as " +
-                 "grain. 0 = off (and free — the branch is skipped).")]
+        // Widens the cone rim to at least this many pixel footprints, the same trick the gobo
+        // prefilter uses: a transition thinner than the sampling grid aliases against it. Only ever
+        // widens, so beams already soft on screen keep their authored edge.
+        [Tooltip("Softens the beam edge to at least this many pixels, so narrow or distant beams " +
+                 "stop showing a staircase. Raise it if edges still look stepped at Third or " +
+                 "Quarter; 0 turns it off. Costs nothing on beams that are already soft.")]
+        [Range(0f, 4f)] [SerializeField] private float _edgeAntiAlias = 1.5f;
+
+        // Beams are wide, smooth, low-slope ramps — exactly what quantizes into Mach bands in the
+        // camera's low-mantissa HDR formats (B10G11R11, 32-bit HDR).
+        [Tooltip("Noise added when beams are composited, to break up the concentric bands a " +
+                 "smooth gradient shows in HDR. Raise until the contours disappear; lower if it " +
+                 "reads as grain. 0 = off, and costs nothing.")]
         [Range(0f, 0.5f)] [SerializeField] private float _dither = 0.15f;
 
         [Tooltip("On: the raymarch dither DRIFTS with the haze (screen-space, matched to the " +
@@ -90,10 +105,11 @@ namespace Origuma.StageBeam
                  "contribution isn't visible anyway.")]
         [Range(0f, 32f)] [SerializeField] private float _minScreenRadiusPx = 0f;
 
-        // Ordered coarsest-to-finest as it reads in the dropdown. NOTE: these serialize by index,
-        // so this ordering is not append-safe — any asset previously saved as Quarter (2) now loads
-        // as Third. Re-check the Resolution Scale on existing Renderer Feature assets.
-        public enum ResolutionScale { Full, Half, Third, Quarter }
+        // LEGACY — superseded by the _resolutionFactor slider; kept only so old assets can
+        // migrate their saved preset (these serialize by index, hence ThreeQuarter at the end:
+        // inserting it "in order" would have shifted every saved Half/Third/Quarter one step
+        // coarser).
+        public enum ResolutionScale { Full, Half, Third, Quarter, ThreeQuarter }
 
         // Back-compat: the old bool field is migrated to the enum on first load (see OnEnable).
         [SerializeField, HideInInspector] private bool _halfResolution = false;
@@ -102,8 +118,27 @@ namespace Origuma.StageBeam
         [Tooltip("ONE dial for \"beams vs scene\": multiplies every beam's volumetric brightness " +
                  "(and the projected pools) without touching per-fixture intensities. The low " +
                  "default keeps performers/characters readable inside beams; raise for a " +
-                 "heavier haze look.")]
-        [Range(0f, 2f)] [SerializeField] private float _masterIntensity = 0.05f;
+                 "heavier haze look. Raise it alongside Anisotropy and the Physical Beam " +
+                 "Model — both redistribute brightness rather than add it, so beams come out " +
+                 "dimmer from the usual viewing angles.")]
+        [Range(0f, 2f)] [SerializeField] private float _masterIntensity = 0.1f;
+
+        // ONE dial for how physical the beam model is (was briefly three: photometric profile,
+        // physical falloff, edge diffusion). Every mixed combination read as an incoherent look —
+        // a candela bell dimming over a normalised ramp, say — so the split bought confusion, not
+        // control. Per-fixture character stays in each fixture's Look (AxialFalloff = falloff
+        // exponent, Hotspot/angles = bell shape). Model and derivations: StageBeamConeCore.hlsl.
+        [Tooltip("How physically the beams behave. 1 = the real thing: candela bell across the " +
+                 "beam (from each fixture's own beam/field angles), brightness decaying down " +
+                 "the throw from an unchanged source end (fixture Axial Falloff = steepness), " +
+                 "and an edge that diffuses over distance. 0 = legacy: flat-topped core, even " +
+                 "brightness ramping off near the far end, constant edge. Redistributes " +
+                 "rather than adds light — rebalance with Master Intensity.")]
+        [Range(0f, 1f)] [SerializeField] private float _physicalModel = 1f;
+
+        [Tooltip("Metres over which a beam eases back in just in front of the camera, so " +
+                 "flying the camera into a beam meets fog instead of a hard bright wall. 0 = off.")]
+        [Range(0f, 3f)] [SerializeField] private float _nearFade = 0.35f;
 
         [Header("Haze Noise (optional)")]
         [Tooltip("Tileable 3D noise that modulates beam density to look like drifting atmosphere. " +
@@ -113,6 +148,15 @@ namespace Origuma.StageBeam
         private bool _hazeNoiseLoadTried;
         [Tooltip("Haze turbulence amount. 0 = off (uniform beam).")]
         [Range(0f, 1f)] [SerializeField] private float _hazeStrength = 0f;
+
+        // View-ray half of Beer-Lambert only. Beams cannot darken what is behind them here: the
+        // pass blends additively, so background occlusion would need alpha coverage and a different
+        // composite.
+        [Tooltip("How much the haze dims a beam over distance toward the camera, per metre. " +
+                 "0 = every sample counts equally, so density only makes a beam brighter and " +
+                 "whiter. 0.02-0.05 gives a beam a visible front and back; higher reads as thick " +
+                 "smoke. Does not darken objects behind the beam.")]
+        [Range(0f, 0.3f)] [SerializeField] private float _hazeExtinction = 0f;
         [Tooltip("World units → noise size. Smaller = larger, softer blobs.")]
         [SerializeField] private float _hazeScale = 0.3f;
         [Tooltip("Drift velocity of the haze in world units per second.")]
@@ -130,12 +174,11 @@ namespace Origuma.StageBeam
                  "character's layer so beams don't paint light onto performers. Everything = " +
                  "no filtering (and no extra cost).")]
         [SerializeField] private LayerMask _projectionReceiverLayers = ~0;
-        [Tooltip("Extra hardness on the FLOOR POOL's shadow only. 0 (default) = the pool's " +
-                 "shadow matches the volumetric beam's soft residual, so the two stay consistent " +
-                 "(the light reaching the floor equals the light left in the beam above it). " +
-                 "Raise it for a crisper floor shadow, but note it then reads DARKER than the " +
-                 "faint beam residual above — a stylistic choice, not physical. To deepen the " +
-                 "occlusion of BOTH the beam and the pool together, raise Volume ▸ Density instead.")]
+        // At 0 the pool's shadow matches the beam's soft residual, which is the consistent
+        // reading: the light reaching the floor is the light left in the beam above it.
+        [Tooltip("Extra shadow hardness on the floor pool only. Raise for a crisper shadow on the " +
+                 "ground, at the cost of it reading darker than the beam directly above it. To " +
+                 "deepen beam and pool together, raise Volume Density instead.")]
         [Range(0f, 0.9f)] [SerializeField] private float _projectionShadowHardness = 0.1f;
 
         [Header("Volumetric Shadows")]
@@ -159,10 +202,11 @@ namespace Origuma.StageBeam
                  "count scales with this) and usually enough for upright performers. Lower if the " +
                  "build's CPU cost matters more than catching perfectly horizontal surfaces.")]
         [Range(1, 3)] [SerializeField] private int _volVoxelizeAxes = 3;
-        [Tooltip("Voxelize skinned occluders by COMPUTE instead of rasterization: same geometry, " +
-                 "same shadow, zero draw calls (the raster path costs one draw + SetPass per " +
-                 "renderer per axis — a cast of performers is hundreds per build). Needs GPU " +
-                 "skinning; renderers whose skinned buffer is unavailable fall back to raster.")]
+        // The raster path costs one draw plus a SetPass per renderer PER AXIS, so a cast of
+        // performers is hundreds of draw calls per build; compute reads the skinned buffers direct.
+        [Tooltip("Build skinned occluders with compute instead of drawing them. Same shadow, but " +
+                 "no draw calls — leave it on. Needs GPU skinning in Player Settings; anything it " +
+                 "cannot read falls back to the drawing path on its own.")]
         [SerializeField] private bool _volComputeSkinned = true;
         [Tooltip("Static/dynamic occluder split (perf). Voxelizes non-moving rigid occluders once " +
                  "into a cached volume and re-voxelizes only dynamic ones (skinned performers + " +
@@ -174,9 +218,11 @@ namespace Origuma.StageBeam
         [Tooltip("Occluder opacity per metre along the shadow ray (Beer-Lambert extinction). " +
                  "8 makes a ~0.5 m body block ~98%; lower for softer, gauzier shadows.")]
         [Range(1f, 16f)] [SerializeField] private float _volDensity = 8f;
-        [Tooltip("Samples along the part of the shadow ray that crosses the occlusion volume. " +
-                 "Raise only if thin occluders shimmer or band.")]
-        [Range(1, 48)] [SerializeField] private int _volSteps = 16;
+        [Tooltip("Cost cap on shadow-ray samples. The march paces itself from the voxel size " +
+                 "(about two voxels per step) so thin occluders always resolve; this only caps " +
+                 "how much that may spend on long spans. If shadows look blobby or noisy, " +
+                 "tighten the volume box or raise its Resolution — not this cap.")]
+        [Range(1, 48)] [SerializeField] private int _volSteps = 32;
         [SerializeField] private float _volMaxDistance = 25f;
         [Tooltip("Temporal smoothing of the shadow volume (0 = off/instant, 1 = heavy). Absorbs " +
                  "the frame-to-frame voxel chatter a MOVING occluder (a dancer) causes, so shadow " +
@@ -233,6 +279,11 @@ namespace Origuma.StageBeam
         private static readonly int IdProjReceiverMask  = Shader.PropertyToID("_ProjReceiverMaskOn");
         private static readonly int IdProjReceiverDepth = Shader.PropertyToID("_StageBeamReceiverDepth");
         private static readonly int IdMasterIntensity   = Shader.PropertyToID("_StageBeamMaster");
+        private static readonly int IdEdgeAntiAlias    = Shader.PropertyToID("_StageBeamEdgeAA");
+        private static readonly int IdPhysicalModel    = Shader.PropertyToID("_StageBeamPhysical");
+        private static readonly int IdNearFade         = Shader.PropertyToID("_StageBeamNearFade");
+        private static readonly int IdGoboFilterWiden  = Shader.PropertyToID("_StageBeamGoboFilterWiden");
+        private static readonly int IdHazeExtinction   = Shader.PropertyToID("_StageBeamExtinction");
 
         public override void Create()
         {
@@ -242,18 +293,26 @@ namespace Origuma.StageBeam
                 if (_halfResolution) _resolutionScale = ResolutionScale.Half;
                 _resolutionMigrated = true;
             }
+            // ...and the retired enum to the float slider, once (chained after the bool so a
+            // pre-enum asset flows bool → enum → float in a single load).
+            if (!_resolutionFactorMigrated)
+            {
+                _resolutionFactor = _resolutionScale switch
+                {
+                    ResolutionScale.ThreeQuarter => 0.75f,
+                    ResolutionScale.Half => 0.5f,
+                    ResolutionScale.Third => 1f / 3f,
+                    ResolutionScale.Quarter => 0.25f,
+                    _ => 1f,
+                };
+                _resolutionFactorMigrated = true;
+            }
             _pass = new StageBeamPass { renderPassEvent = _event };
             _upsampleMat   = CoreUtils.CreateEngineMaterial("Origuma/StageBeamUpsample");
             _projectionMat = CoreUtils.CreateEngineMaterial("Origuma/StageBeamProjection");
         }
 
-        private int ResolutionDivisor => _resolutionScale switch
-        {
-            ResolutionScale.Half => 2,
-            ResolutionScale.Third => 3,
-            ResolutionScale.Quarter => 4,
-            _ => 1,
-        };
+        private float ResolutionDivisor => 1f / Mathf.Clamp(_resolutionFactor, 0.25f, 1f);
 
         protected override void Dispose(bool disposing)
         {
@@ -462,6 +521,16 @@ namespace Origuma.StageBeam
             // Window > Origuma > Stage Beam > Log Occlusion Build Cost to read the cost meanwhile.
             PrepareOcclusion()?.BuildAndBind();
             Shader.SetGlobalFloat(IdMasterIntensity, _masterIntensity);
+            Shader.SetGlobalFloat(IdEdgeAntiAlias, _edgeAntiAlias);
+            Shader.SetGlobalFloat(IdPhysicalModel, _physicalModel);
+            Shader.SetGlobalFloat(IdNearFade, _nearFade);
+            // Gobo prefilter widening: 1 at Full, ~1.08 / 1.25 / 1.5 / 1.75 at ThreeQuarter /
+            // Half / Third / Quarter.
+            // The march's mip footprint targets exactly the sampling rate; when the buffer is
+            // magnified back to screen, that borderline choice is what remains visible as gobo
+            // moire, so filter slightly below the rate the smaller the buffer gets.
+            Shader.SetGlobalFloat(IdGoboFilterWiden, 0.75f + 0.25f * ResolutionDivisor);
+            Shader.SetGlobalFloat(IdHazeExtinction, _hazeExtinction);
             Shader.SetGlobalFloat(IdTemporalJitter, _temporalJitter ? 1f : 0f);
 
             // Screen-space velocity (pixels/sec) the raymarch dither drifts at, matched to the
@@ -567,7 +636,7 @@ namespace Origuma.StageBeam
         private sealed class StageBeamPass : ScriptableRenderPass
         {
             public float     Dither = 0.02f;          // anti-banding at the composite write
-            public int       ResolutionDivisor = 1;   // 1 = full, 2 = half, 3 = third, 4 = quarter
+            public float     ResolutionDivisor = 1;   // 1 = full, 4/3 = three-quarter, 2 = half, …
             public bool      NoiseSmoothing = true;
             public bool      AllowInstancing = true;   // false in LightShadowMap mode (see feature)
             public Material  UpsampleMat;
@@ -638,8 +707,8 @@ namespace Origuma.StageBeam
                 // Soft Additive needs the composite to see the SUMMED beam total (the ceiling
                 // curve can't be expressed per-beam), so it always routes through the offscreen
                 // buffer — at full resolution unless the resolution scale asked for less.
-                int divisor = ResolutionDivisor;
-                if (divisor > 1 || StageBeamQueue.SoftComposite)
+                float divisor = ResolutionDivisor;
+                if (divisor > 1.001f || StageBeamQueue.SoftComposite)
                     RecordOffscreen(renderGraph, resources, camera, divisor);
                 else
                     RecordFullRes(renderGraph, resources, camera);
@@ -894,11 +963,11 @@ namespace Origuma.StageBeam
             // Offscreen accumulation + composite: divisor 2 = the half-res path, divisor 1 =
             // full-res (used by Soft Additive, whose ceiling curve needs the summed total).
             private void RecordOffscreen(RenderGraph renderGraph, UniversalResourceData resources,
-                                         UniversalCameraData camera, int divisor)
+                                         UniversalCameraData camera, float divisor)
             {
                 var desc = camera.cameraTargetDescriptor;
-                var offW = Mathf.Max(1, desc.width  / divisor);
-                var offH = Mathf.Max(1, desc.height / divisor);
+                var offW = Mathf.Max(1, Mathf.RoundToInt(desc.width  / divisor));
+                var offH = Mathf.Max(1, Mathf.RoundToInt(desc.height / divisor));
 
                 var offDesc = desc;
                 offDesc.width           = offW;

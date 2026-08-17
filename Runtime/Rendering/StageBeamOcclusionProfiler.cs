@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using UnityEngine;
 using UnityEngine.Rendering;
 
 namespace Origuma.StageBeam
@@ -50,7 +51,15 @@ namespace Origuma.StageBeam
         // demand and kept for the session (they are cheap and must outlive the frames they time).
         private readonly Dictionary<string, ProfilingSampler> _samplers =
             new Dictionary<string, ProfilingSampler>(16);
-        private readonly Dictionary<string, double> _lastMs = new Dictionary<string, double>(16);
+        // A ring of recent readings per pass, not a single value. Three consecutive "optimizations"
+        // were each judged a regression off one frame apiece (0.188 / 0.239 / 0.247 ms) before
+        // anyone asked what a SECOND reading of the unchanged build would have said. One sample
+        // cannot separate a 30% regression from 30% frame-to-frame spread, and every conclusion
+        // drawn from one is a guess wearing three decimal places.
+        private const int Window = 64;
+        private readonly Dictionary<string, double[]> _ring = new Dictionary<string, double[]>(16);
+        private readonly Dictionary<string, int> _ringCount = new Dictionary<string, int>(16);
+        private readonly Dictionary<string, int> _ringHead = new Dictionary<string, int>(16);
         private readonly List<string> _order = new List<string>(16);
 
         /// <summary>
@@ -91,23 +100,71 @@ namespace Origuma.StageBeam
                 // Already MILLISECONDS — ProfilingSampler.gpuElapsedTime does the nanosecond
                 // conversion itself. Scaling it again reported microseconds as milliseconds.
                 float ms = kv.Value.gpuElapsedTime;
-                // A recorder with no completed sample reports 0 — keep the previous reading so a
-                // pass that ran a frame ago doesn't flicker to zero in the report.
-                if (ms > 0f) _lastMs[kv.Key] = ms;
+                // A recorder with no completed sample reports 0 — skip it rather than poisoning
+                // the window with a zero a pass never actually achieved.
+                if (ms <= 0f) continue;
+                if (!_ring.TryGetValue(kv.Key, out var ring))
+                {
+                    _ring[kv.Key] = ring = new double[Window];
+                    _ringCount[kv.Key] = 0;
+                    _ringHead[kv.Key] = 0;
+                }
+                int head = _ringHead[kv.Key];
+                ring[head] = ms;
+                _ringHead[kv.Key] = (head + 1) % Window;
+                _ringCount[kv.Key] = Mathf.Min(Window, _ringCount[kv.Key] + 1);
             }
         }
 
         /// <summary>Pass timings in the order they were first recorded, in milliseconds.</summary>
         public IReadOnlyList<string> PassOrder => _order;
-        public double GetMs(string passName) => _lastMs.TryGetValue(passName, out var v) ? v : 0.0;
+
+        /// <summary>
+        /// Distribution of a pass's recent GPU times in milliseconds. MEDIAN is the figure to
+        /// compare across builds and MIN is the cleanest read of the pass's own cost (the one least
+        /// contaminated by whatever else the GPU was doing); the SPREAD between them says whether a
+        /// difference between two builds means anything at all.
+        /// </summary>
+        public bool TryGetStats(string passName, out double min, out double median, out double max,
+                                out int samples)
+        {
+            min = median = max = 0.0; samples = 0;
+            if (!_ring.TryGetValue(passName, out var ring)) return false;
+            samples = _ringCount[passName];
+            if (samples == 0) return false;
+
+            var sorted = new double[samples];
+            System.Array.Copy(ring, sorted, samples);
+            System.Array.Sort(sorted);
+            min = sorted[0];
+            max = sorted[samples - 1];
+            median = (samples & 1) == 1
+                ? sorted[samples / 2]
+                : (sorted[samples / 2 - 1] + sorted[samples / 2]) * 0.5;
+            return true;
+        }
+
+        private double MedianMs(string passName)
+            => TryGetStats(passName, out _, out var med, out _, out _) ? med : 0.0;
+
+        /// <summary>Sum of the per-pass medians.</summary>
         public double TotalMs
         {
             get
             {
                 double t = 0.0;
-                foreach (var kv in _lastMs) t += kv.Value;
+                for (int i = 0; i < _order.Count; i++) t += MedianMs(_order[i]);
                 return t;
             }
+        }
+
+        /// <summary>Drop every reading. Call when switching between two builds being compared, so
+        /// the window holds one configuration rather than a blend of both.</summary>
+        public void ResetWindow()
+        {
+            _ring.Clear();
+            _ringCount.Clear();
+            _ringHead.Clear();
         }
 
         /// <summary>Wraps a ProfilingScope so the disabled case can be a genuine no-op — a

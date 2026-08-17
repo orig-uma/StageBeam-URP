@@ -64,6 +64,9 @@ Shader "Origuma/StageBeamProjection"
             float _ProjSurfaceBoost;   // brightness multiplier for the projected pool
             float _ProjNormalCull;     // 0..1 cosine band: surfaces steeper than this fade out
             float _ProjShadowHardness; // 0 = raw soft shadow, higher = occluded pool → fully black
+            float _StageBeamPhysical;  // same physical-model lerp the cone uses (StageBeamConeCore.hlsl)
+            float  _BeamTemporalJitter; // 1 = animate the shadow jitter (same global the cone march uses)
+            float4 _BeamJitterScroll;   // xy = screen px/sec the dither drifts (matched to the haze)
 
             // Receiver layer mask: a depth-only pre-pass of ONLY the receiver layers. A pixel
             // receives projection only when the visible surface IS that receiver surface
@@ -133,7 +136,24 @@ Shader "Origuma/StageBeamProjection"
                 float sideSoftness = max(_EdgeSoftness, 0.01);
                 float side = saturate((coneR - rad) / (coneR * sideSoftness));
                 float axNorm = axis / _Range;
+                // Physical-mode pool falloff: the SAME optics-anchored irradiance the cone uses —
+                // E ∝ 1/d² from the virtual apex, normalised to 1 at the lens, AxialFalloff as
+                // the exponent (2 = true inverse-square). A range-normalised exponential sat
+                // here for one release to spare _ProjSurfaceBoost a re-tune, but it made the
+                // decal's brightness follow a different law than the light feeding it — exactly
+                // the kind of mismatch that reads as "one fixture's pool is inexplicably hot".
+                // Wide zooms now genuinely dim (zA is centimetres for a wash): that is the real
+                // optics, and the absolute exposure is Boost's job.
+                // No self-extinction term — this pass has no density input, and the haze on that
+                // path is already visible as the beam directly above the pool.
                 float axialAtt = saturate(1.0 - axNorm * axNorm * _AxialFalloff);
+                if (_StageBeamPhysical > 1e-3)
+                {
+                    float zA  = _StartRadius / tanField;
+                    float dSq = max(rad * rad + (axis + zA) * (axis + zA), 1e-6);
+                    float attPhys = pow(zA * zA / dSq, 0.5 * _AxialFalloff);
+                    axialAtt = lerp(axialAtt, attPhys, _StageBeamPhysical);
+                }
 
                 // Normal culling: geometric normal from depth. Plain ddx/ddy quad derivatives
                 // get noisy on curved surfaces, at depth edges and at grazing angles — pick the
@@ -153,6 +173,10 @@ Shader "Origuma/StageBeamProjection"
                 float3 beamDownWS = normalize(TransformObjectToWorldDir(float3(0, -1, 0)));
                 float facing = dot(nWS, -beamDownWS);       // 1 = facing the lens, <0 = away
                 float normalFade = smoothstep(0.0, max(_ProjNormalCull, 1e-3), facing);
+                // Lambert: real surface irradiance carries cos(incidence). The smoothstep above
+                // is an artifact CULL (grazing depth-reconstruction noise), not a shading term —
+                // under the physical model the true cosine multiplies in as well.
+                normalFade *= lerp(1.0, saturate(facing), _StageBeamPhysical);
                 if (normalFade <= 0.0) return 0;
 
                 // Gobo projection (wheel 1 × wheel 2), same field coords as the cone.
@@ -191,9 +215,17 @@ Shader "Origuma/StageBeamProjection"
 
             #if defined(_STAGEBEAM_SHADOWS_SCREEN) || defined(_STAGEBEAM_SHADOWS_VOLUME) || defined(_STAGEBEAM_SHADOWS_LIGHT)
                 // Shadow the light pool where the occluder blocks the beam from the surface point.
+                // The march jitter DRIFTS over time (same velocity convention as the cone march):
+                // a static per-pixel phase makes each pixel blink coherently as a moving shadow
+                // edge sweeps its threshold — the decal's visible shimmer. A drifting phase turns
+                // that into zero-mean animated grain, which the occupancy's temporal EMA upstream
+                // and the eye's own integration absorb. Pools have no denoise pass of their own,
+                // so this is their one temporal smoothing mechanism.
+                float2 jpix = i.positionHCS.xy;
+                if (_BeamTemporalJitter > 0.5) jpix += _BeamJitterScroll.xy * _Time.y;
                 float shadow = SampleBeamShadow(surfWS,
                     TransformObjectToWorld(float3(0.0, 0.0, 0.0)),
-                    StageBeamIGN(i.positionHCS.xy));
+                    StageBeamIGN(jpix));
                 // The volumetric shadow is a soft transmittance (exp falloff) that never quite
                 // reaches 0, so a sharp gobo pool keeps a faint residual even when fully blocked.
                 // Remap so transmittance below the hardness threshold clamps to fully black — a
@@ -239,6 +271,9 @@ Shader "Origuma/StageBeamProjection"
             float _ProjSurfaceBoost;
             float _ProjNormalCull;
             float _ProjShadowHardness;
+            float _StageBeamPhysical;
+            float  _BeamTemporalJitter;
+            float4 _BeamJitterScroll;
             float _ProjReceiverMaskOn;
             TEXTURE2D_X(_StageBeamReceiverDepth);
             SAMPLER(sampler_StageBeamReceiverDepth);
@@ -293,7 +328,15 @@ Shader "Origuma/StageBeamProjection"
                 float sideSoftness = max(edgeSoftness, 0.01);
                 float side = saturate((coneR - rad) / (coneR * sideSoftness));
                 float axNorm = axis / range;
+                // Optics-anchored irradiance, same as the uniform pass above (and the cone).
                 float axialAtt = saturate(1.0 - axNorm * axNorm * axialFalloff);
+                if (_StageBeamPhysical > 1e-3)
+                {
+                    float zA  = startRadius / tanField;
+                    float dSq = max(rad * rad + (axis + zA) * (axis + zA), 1e-6);
+                    float attPhys = pow(zA * zA / dSq, 0.5 * axialFalloff);
+                    axialAtt = lerp(axialAtt, attPhys, _StageBeamPhysical);
+                }
 
                 float2 px = float2(1.0 / _ScreenParams.x, 0.0);
                 float2 py = float2(0.0, 1.0 / _ScreenParams.y);
@@ -308,6 +351,8 @@ Shader "Origuma/StageBeamProjection"
                 float3 beamDownWS = normalize(StageBeamObjectToWorldDir(b, float3(0, -1, 0)));
                 float facing = dot(nWS, -beamDownWS);
                 float normalFade = smoothstep(0.0, max(_ProjNormalCull, 1e-3), facing);
+                // Lambert cosine under the physical model — see the uniform pass.
+                normalFade *= lerp(1.0, saturate(facing), _StageBeamPhysical);
                 if (normalFade <= 0.0) return 0;
 
                 float gobo = 1.0;
@@ -336,9 +381,13 @@ Shader "Origuma/StageBeamProjection"
                 float intensity = intensityP * _ProjSurfaceBoost * side * axialAtt * normalFade * gobo * nearFade;
 
             #if defined(_STAGEBEAM_SHADOWS_SCREEN) || defined(_STAGEBEAM_SHADOWS_VOLUME) || defined(_STAGEBEAM_SHADOWS_LIGHT)
+                // Drifting jitter phase — see the uniform pass for why this is the decal's one
+                // temporal smoothing mechanism.
+                float2 jpix = i.positionHCS.xy;
+                if (_BeamTemporalJitter > 0.5) jpix += _BeamJitterScroll.xy * _Time.y;
                 float shadow = SampleBeamShadow(surfWS,
                     StageBeamObjectToWorld(b, float3(0.0, 0.0, 0.0)),
-                    StageBeamIGN(i.positionHCS.xy));
+                    StageBeamIGN(jpix));
                 shadow = saturate((shadow - _ProjShadowHardness) / max(1.0 - _ProjShadowHardness, 1e-3));
                 intensity *= shadow;
             #endif

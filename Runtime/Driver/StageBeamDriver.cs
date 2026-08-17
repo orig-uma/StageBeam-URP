@@ -14,8 +14,16 @@ namespace Origuma.StageBeam
     /// source each frame.
     /// </summary>
     [AddComponentMenu("Stage Beam/Stage Beam Driver")]
+    [ExecuteAlways]   // authoring without Play mode; see StageEditModePreview
     public sealed class StageBeamDriver : MonoBehaviour
     {
+        /// <summary>
+        /// Draw beams outside Play mode. Its own flag rather than a reference to the rig's: this
+        /// package is the generic renderer and knows nothing about rigs, shows or DMX — the
+        /// dependency runs one way, and an editor toggle sets both sides.
+        /// </summary>
+        public static bool EditModePreview;
+
         /// <summary>Additive blows out where beams overlap / against bright scenes; Soft Additive
         /// (screen blend) adds less where the background is already bright, so it saturates gently.</summary>
         public enum BeamBlend { Additive, SoftAdditive }
@@ -30,26 +38,43 @@ namespace Origuma.StageBeam
         // stacking to pure white.
         public BeamBlend Blend = BeamBlend.SoftAdditive;
 
-        [Tooltip("Soft Additive: the TOTAL brightness stacked beams may reach (the haze " +
-                 "ceiling). One beam looks the same; overlaps saturate toward this value, so " +
-                 "performers inside the light stay visible. 0.3–0.6 keeps a thin, fog-like read.")]
-        [Range(0.05f, 1.5f)] public float SoftMaxBrightness = 0.5f;
+        // Composite curve is K*(1 - exp(-total/K)): identity slope at 0, asymptotic to K. The knee
+        // therefore sits near K, so the value has to be chosen against the totals the rig actually
+        // reaches — it is not an absolute look setting, and it moves whenever Master Intensity or
+        // the scattering does.
+        [Tooltip("Soft Additive: the brightness stacked beams saturate toward. Set it just above " +
+                 "what a single beam reaches, so one beam is untouched and only overlaps compress " +
+                 "— around 1.5-2 for a typical rig. Too low and every beam looks washed out and " +
+                 "thin; too high and overlaps pile up to white and swallow anyone standing in " +
+                 "them. Ignored unless Blend is Soft Additive.")]
+        [Range(0.05f, 5f)] public float SoftMaxBrightness = 5f;
 
-        [Tooltip("Scale raymarch steps DOWN as a beam zooms wide (reference 20° field): a wide " +
-                 "cone covers far more pixels but is dimmer and softer per flux conservation, " +
-                 "so it tolerates fewer samples — this keeps the wide-zoom fill-rate cost from " +
-                 "exploding. Floor of 8 steps; ×0.5 at 40°+.")]
+        // Softens the aliased line where the volumetric meets geometry. Kept near zero: the fade
+        // takes the shaft to zero at contact while the surface projection pass draws the light pool
+        // at full brightness, so any real width of it shows up as a gap between a beam and its own
+        // gobo pattern. The aliasing it was introduced to hide shrinks as Resolution Scale rises.
+        [Tooltip("Metres over which a beam fades out where it lands on a surface. Raise it if the " +
+                 "contact line crawls or flickers — worst when a beam rakes across the floor at a " +
+                 "grazing angle. Lower it if the beam looks like it hovers above its light pool. " +
+                 "0 = hard edge.")]
+        [Range(0f, 1f)] public float SurfaceContactFade = 0.01f;
+
+        // A wide cone covers far more pixels but is dimmer and softer per flux conservation, so it
+        // tolerates fewer samples; without this the fill-rate cost of a wide zoom explodes.
+        [Tooltip("Use fewer raymarch steps on beams zoomed wider than 20°, down to a floor of 8 " +
+                 "(half the steps at 40° and above). Keeps wide zooms cheap. Turn it off if wide " +
+                 "beams look banded or grainy next to narrow ones.")]
         public bool AdaptiveSteps = true;
 
         [Tooltip("Radial segments of the shared cone mesh.")]
         [Range(6, 64)] public int Segments = 24;
 
-        [Tooltip("Draw beams via GPU instancing (one DrawMeshInstancedProcedural per gobo group) " +
-                 "instead of one DrawMesh per beam. Cuts CPU/draw-call overhead at high light counts. " +
-                 "The fragment (fill-rate) cost is the same — per-beam data is passed to the fragment " +
-                 "via interpolators, not a per-pixel buffer read — so this is roughly parity at low " +
-                 "counts and a slight win at high counts (draw-call bound). Volume/Screen/no-shadow " +
-                 "only (not LightShadowMap). Off = the classic per-beam path.")]
+        // One DrawMeshInstancedProcedural per gobo group instead of one DrawMesh per beam. Fill
+        // rate is unchanged — per-beam data reaches the fragment through interpolators, not a
+        // per-pixel buffer read — so the win is purely CPU/draw-call side.
+        [Tooltip("Draw all beams sharing a gobo in one call instead of one call each. Saves CPU " +
+                 "when the rig is large; makes little difference with few beams, and none to " +
+                 "GPU cost. Ignored when Shadows is LightShadowMap.")]
         public bool GpuInstancing;
 
         /// <summary>All sources currently feeding this driver.</summary>
@@ -67,6 +92,8 @@ namespace Origuma.StageBeam
         private static readonly int IdSrcBlend = Shader.PropertyToID("_BeamSrcBlend");
         private static readonly int IdDstBlend = Shader.PropertyToID("_BeamDstBlend");
         private static readonly int IdBeamSoft = Shader.PropertyToID("_BeamSoft");
+        private static readonly int IdSurfaceFade = Shader.PropertyToID("_SurfaceFadeDist");
+        private float _appliedFade = -1f;
 
         private readonly List<StageBeamInstance> _instances = new List<StageBeamInstance>(64);
         private readonly List<MaterialPropertyBlock> _mpbPool = new List<MaterialPropertyBlock>();
@@ -132,6 +159,18 @@ namespace Origuma.StageBeam
             return _instance;
         }
 
+        /// <summary>
+        /// Destroys a generated asset from either mode. Plain Destroy is a no-op-with-an-error
+        /// outside Play, and these objects (the shared cone mesh, the runtime material) are created
+        /// per session and must actually go — otherwise every domain reload leaks another one.
+        /// </summary>
+        private static void DestroyGenerated(Object o)
+        {
+            if (o == null) return;
+            if (Application.isPlaying) Destroy(o);
+            else DestroyImmediate(o);
+        }
+
         private void OnDisable()
         {
             if (_instance == this) _instance = null;
@@ -139,11 +178,11 @@ namespace Origuma.StageBeam
             StageBeamQueue.Begin();
             StageBeamQueue.Mesh = null;
             StageBeamQueue.Material = null;
-            if (_cone != null) Destroy(_cone);
+            DestroyGenerated(_cone);
             if (_ownsMat && _mat != null)
             {
                 if (Material == _mat) Material = null;   // don't leave a destroyed ref visible
-                Destroy(_mat);
+                DestroyGenerated(_mat);
             }
             _ownsMat = false;
             _cone = null; _mat = null; _builtSegments = -1;
@@ -157,6 +196,7 @@ namespace Origuma.StageBeam
 
         private void LateUpdate()
         {
+            if (!Application.isPlaying && !EditModePreview) return;
             if (_sources.Count == 0) return;
             EnsureResources();
 
@@ -243,7 +283,7 @@ namespace Origuma.StageBeam
         {
             if (_cone == null || _builtSegments != Segments)
             {
-                if (_cone != null) Destroy(_cone);
+                DestroyGenerated(_cone);
                 _cone = BuildUnitCone(Segments);
                 _builtSegments = Segments;
             }
@@ -271,6 +311,15 @@ namespace Origuma.StageBeam
                 _mat.SetFloat(IdDstBlend, 1f);
                 _mat.SetFloat(IdBeamSoft, 0f);
                 _appliedBlend = Blend;
+            }
+
+            // Not inside the blend block: this is independent of blend mode and has to follow the
+            // field whenever it is edited or animated. A material float lives in UnityPerMaterial,
+            // so a global of the same name would be ignored — it has to be set on the material.
+            if (_appliedFade != SurfaceContactFade)
+            {
+                _appliedFade = SurfaceContactFade;
+                _mat.SetFloat(IdSurfaceFade, Mathf.Max(SurfaceContactFade, 1e-4f));
             }
 
             // Published every frame (cheap statics) so the renderer feature routes/saturates

@@ -16,9 +16,10 @@ namespace Origuma.StageBeam
         [Tooltip("Also draw when the object is not selected.")]
         public bool AlwaysDraw = true;
 
-        [Tooltip("Print the last build's draw-call count above the volume box. The occupancy " +
-                 "build runs outside the render graph, so the Frame Debugger cannot show it — " +
-                 "this is the only way to see what the mesh voxelizer actually costs.")]
+        // The occupancy build runs outside the render graph, so the Frame Debugger cannot attribute
+        // it — this label and the cost report are the only places its cost shows up.
+        [Tooltip("Show the last build's draw-call count above the volume box. Use it to see what " +
+                 "the mesh voxelizer costs; the Frame Debugger cannot show this pass.")]
         public bool ShowBuildCost = true;
 
         private void OnDrawGizmos() { if (AlwaysDraw) Draw(ShowBuildCost); }

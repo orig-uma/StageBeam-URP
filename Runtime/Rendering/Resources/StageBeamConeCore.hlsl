@@ -17,10 +17,27 @@ float  _HazeScale;      // world units -> noise UVW
 float4 _HazeScroll;     // xyz = animated world-space offset
 
 float  _StageBeamMaster;     // global master brightness
+float  _StageBeamEdgeAA;     // cone-rim softening in pixel footprints; 0 = off
+float  _StageBeamExtinction; // haze extinction per metre along the view ray; 0 = pure additive
+// ONE physical-model dial (0 = legacy, 1 = physical), driving the candela bell, the
+// lens-anchored exponential falloff AND the distance-diffused rim below. They were three
+// dials briefly; every combination other than "all legacy" or "all physical" was an
+// incoherent look (a bell profile dimming over a normalised ramp, say), so the split bought
+// confusion, not control. Per-fixture character still comes from the Look: AxialFalloff sets
+// the decay, Hotspot/angles shape the bell, EdgeSoftness the rim.
+float  _StageBeamPhysical;
+float  _StageBeamNearFade;   // metres a beam eases back in over, right in front of the camera
 float  _BeamFrameIndex;
 float  _BeamTemporalJitter;  // 1 = animated jitter, 0 = static IGN
 float4 _BeamJitterScroll;    // xy = screen px/sec the dither drifts (matches haze)
 float4 _BeamRTParams;        // xy = 1 / render-target size (correct depth UV at any resolution)
+// Gobo prefilter widening, derived from the resolution scale by the renderer feature (1 at
+// Full). The mip footprint below filters shafts to exactly the sampling rate; that is Nyquist-
+// BORDERLINE, and once the buffer is rendered small and magnified back up, the residual
+// near-Nyquist energy is exactly what shows as moire. Filtering slightly below the rate at
+// reduced resolutions trades a little shaft sharpness for a stable image — no dial, it follows
+// the one resolution choice the user already made.
+float  _StageBeamGoboFilterWiden;
 
 // --- Per-beam parameters (filled from CBUFFER or StructuredBuffer by the entry shader) --------
 struct BeamParams
@@ -169,6 +186,15 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
     // screen-space velocity matched to the haze scroll, so the grain reads as the fog drifting.
     float2 jpix = screenPix;
     if (_BeamTemporalJitter > 0.5) jpix += _BeamJitterScroll.xy * _Time.y;
+    // Decorrelate the sampling phase BETWEEN beams. Every march at a pixel otherwise uses the
+    // same IGN value, so overlapping cones — prism facets above all, which share an apex and
+    // differ only by a small rotation — place their sample combs in lockstep, and two aligned
+    // combs through fine gobo shafts BEAT: a structured moire the denoiser must preserve
+    // because it does not look like noise. camCL is per-beam (it rotates with the facet's
+    // frame) and already an input, so the hash costs one dot+frac and no new plumbing;
+    // decorrelated, the interference turns into incoherent grain that dither, the denoise
+    // pass and temporal integration already know how to eat.
+    jpix += frac(dot(camCL, float3(12.9898, 78.233, 37.719))) * 64.0;
     float jitterNoise  = IGN(jpix);
     float shadowJitter = jitterNoise;
     float stepSize     = chord / steps;
@@ -183,6 +209,14 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
     float tanBeam = max(tan(p.beamHalf), 1e-4);
     float rootLen = max(p.rootBoostFrac * p.range, 1e-3);
 
+    // Virtual apex: the point the lens optics appear to emit from, zApexLen metres BEHIND the
+    // lens (the same construction BeamEntryDistance solves its cone with, since the lateral
+    // slope is tanField). The physical falloff takes its knee from this length, and the phase
+    // direction is measured from here — finite right at the lens, so it never divides by ~0
+    // at the root.
+    float zApexLen = radiusStart / tanField;
+    float invNearFade = 1.0 / max(_StageBeamNearFade, 1e-4);
+
     bool  usePhase = abs(p.anisotropy) > 1e-3;
     float phaseG   = p.anisotropy;
     float phaseG2  = phaseG * phaseG;
@@ -194,6 +228,17 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
     float whiteSumNH = 0.0;
     float shadowCache = 1.0;
     float hazeCache   = 1.0;
+    // Transmittance from the camera to the sample being shaded. Without it the march is a plain
+    // SUM: every sample counts the same whether it is the near face of the beam or the far one, so
+    // a dense beam just grows brighter and whiter instead of gaining a front and a back. Real haze
+    // scatters and absorbs on the way to the eye, so the far side arrives attenuated — that is
+    // what reads as volume rather than as a lit fog.
+    //
+    // This is the VIEW-RAY half of Beer-Lambert only. The other half, the beam occluding what is
+    // behind it, cannot be done here: the pass blends additively (One One), and making a beam
+    // darken its background needs coverage in the alpha channel and an alpha-blended composite,
+    // which is a change to the whole compositing chain rather than to this loop.
+    float trans = 1.0;
     [loop]
     for (int k = 0; k < steps; k++)
     {
@@ -203,6 +248,8 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
 
         float z = p3.z;
         float inAxis = step(0.0, z) * step(z, p.range);
+        float axNorm = z / p.range;
+        float3 relApex = float3(p3.xy, z + zApexLen);   // sample position from the virtual apex
 
         float hazeF = 1.0;
         if (_HazeStrength > 0.0001)
@@ -219,7 +266,26 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
         float widthAtZ = BeamWidthAt(z, radiusStart, radiusEnd, p.range);
         float radial   = length(p3.xy);
 
-        float side = saturate((widthAtZ - radial) / (widthAtZ * sideSoftness));
+        // Edge antialiasing, on the same principle the gobo filter already uses: a feature
+        // thinner than the sampling grid must be widened until it is resolvable, or it aliases
+        // against it. `edge` is the normalised distance in from the cone's rim, and its screen
+        // gradient says how much of that field one pixel spans; softening by at least that much
+        // guarantees the rim always crosses a full pixel of gradient rather than snapping between
+        // in and out. A Spot's authored softness is 0.15 of the beam radius, which is under one
+        // pixel once a narrow beam is far away or the buffer is at Third — hence the staircase.
+        //
+        // Costs two derivatives and never sharpens: a beam wide enough on screen keeps exactly the
+        // softness it was authored with, since the footprint is then the smaller of the two.
+        float edge = (widthAtZ - radial) / max(widthAtZ, 1e-5);
+        // Haze diffuses a throw as it travels: the rim a metre from the lens keeps the authored
+        // sharpness, the far end reads visibly blurrier. Linear in z — multiple scattering blur
+        // grows roughly with path length — and one madd per sample is the whole cost. The 0.25
+        // gain (a quarter of full softness added by the far end) is fixed: per-fixture rim width
+        // is already EdgeSoftness's job, and a separate growth dial proved indistinguishable
+        // from it in practice.
+        float sideSoftEff = sideSoftness + 0.25 * _StageBeamPhysical * axNorm;
+        float edgeSoft = max(sideSoftEff, fwidth(edge) * _StageBeamEdgeAA);
+        float side = saturate(edge / edgeSoft);
 
         float widthBeam = z * tanBeam + radiusStart;
         float rNorm = radial / max(widthAtZ, 1e-5);
@@ -227,10 +293,66 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
         float hot = 1.0 - smoothstep(0.0, beamFrac, rNorm);
         float hotFactor = 1.0 + p.hotspot * hot;
 
-        float rootBoost = 1.0 + p.rootBoost * exp(-z / rootLen);
+        // --- Photometric profile ------------------------------------------------------------
+        // A fixture is specified by two angles with agreed meanings: the BEAM angle is where its
+        // intensity has fallen to 50% of peak, the FIELD angle where it reaches 10%. That is a
+        // smooth bell, falling the whole way out. The bump above is not that shape — it decays to
+        // 1.0 at the beam angle and then sits FLAT until `side` cuts the field edge off, so the
+        // core is a raised plateau on a slab rather than a peak, which is why the centre never
+        // reads as a core no matter how far Hotspot is pushed.
+        //
+        // exp(-k*r^n) hits both anchors exactly: k = ln(10) puts 10% at the field edge, and n
+        // solves exp(-k*beamFrac^n) = 0.5. Nothing new to author — both angles already come from
+        // GDTF, so a fixture whose beam angle is near its field angle stays broad and one whose
+        // beam angle is half of it gets a genuinely sharp core, straight from its own data.
+        //
+        // Matched at the CENTRE, not by area: the peak stays where the old model put it and the
+        // surroundings fall away, so this DIMS a beam overall. That is the honest consequence of
+        // replacing a plateau with a bell; compensate with Intensity or Master, not by flattening
+        // the profile back out.
+        //
+        // Behind a branch on a UNIFORM: a log, a pow and an exp per sample is real money at 48
+        // steps, and without the guard every frame pays it to multiply the result by zero.
+        if (_StageBeamPhysical > 1e-3)
+        {
+            float bf   = clamp(beamFrac, 0.05, 0.95);
+            float nExp = log(0.30103) / log(bf);        // ln(ln2/ln10) / ln(beamFrac)
+            float bell = exp(-2.302585 * pow(max(rNorm, 1e-5), nExp));
+            hotFactor  = lerp(hotFactor, (1.0 + p.hotspot) * bell, _StageBeamPhysical);
+        }
 
-        float axNorm   = z / p.range;
+        // Same reasoning as the bell above: RootBoost is off on most fixtures, and the exp is
+        // pure waste on those. Uniform per beam, so the branch is coherent across the wave.
+        float rootBoost = 1.0;
+        if (p.rootBoost > 1e-4) rootBoost = 1.0 + p.rootBoost * exp(-z / rootLen);
+
+        // --- Distance falloff ---------------------------------------------------------------
+        // Legacy: an inverted parabola in z/range — flat near the root with all the dimming
+        // shoved to the far end. Physical mode: irradiance from the virtual apex, normalised
+        // AT THE LENS — att = (zA/(z+zA))^AxialFalloff, exactly 1 at z = 0 (the root is never
+        // brightened; source glare is RootGlare/lens-emissive's job) and 2 = true inverse
+        // square. zA is derived from each beam's own optics, and that is the point: it is the
+        // knee of the curve, so a NARROW zoom (zA metres to tens of metres) reads as a solid
+        // stick reaching far, while a WIDE wash (zA well under a metre) glows under the
+        // fixture and dies — the zoom-dependent character real fixtures have, with nothing
+        // per-fixture to author and no dependence on Range at all.
+        //
+        // NOT the exponential exp(-k·z) tried before this: a constant relative decay is
+        // cancelled by the cone's own linear width growth, so a wide cone's side-on brightness
+        // (chord × att ∝ (z+zA)·att) RISES until z ≈ 1/k and the top half reads as a flat
+        // CG slab. This curve makes chord × att = (z+zA)^(1-falloff), monotone falling from
+        // the lens for any falloff > 1 — the beam visibly starts dying the moment it leaves
+        // the glass. With global extinction on, the light's own Beer-Lambert path through the
+        // haze (∝ density) still multiplies in, so dense beams die sooner than clean ones.
+        // One pow (+ exp under extinction) per sample, uniform-branched like the bell above.
         float axialAtt = saturate(1.0 - axNorm * axNorm * p.axialFalloff);
+        if (_StageBeamPhysical > 1e-3)
+        {
+            float attPhys = pow(zApexLen / (max(z, 0.0) + zApexLen), p.axialFalloff);
+            if (_StageBeamExtinction > 1e-5)
+                attPhys *= exp(-_StageBeamExtinction * p.density * max(z, 0.0));
+            axialAtt = lerp(axialAtt, attPhys, _StageBeamPhysical);
+        }
 
         float gobo = 1.0;
         if (useGobo || useGobo2)
@@ -249,8 +371,18 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
             // Gradients come from g, NOT the frac()'d UV: frac's wrap discontinuity would spike the
             // derivative and slam the sampler to the coarsest mip in a line along the seam.
             float2 dgdt    = (rayCL.xy - g * (goboSlope * rayCL.z)) / max(widthAtZ, 1e-5);
+            // Full-step ray footprint, restored after an attempt at half-step: the sharper
+            // shafts it bought were then lost anyway inside the half-res buffer (whose own
+            // grid became the limit), while the removed margin let borderline moire through
+            // at the distances where the two footprints cross over. Shaft peak brightness is
+            // capped by the BUFFER resolution before it is capped by this filter — the honest
+            // lever is the Resolution Scale, not under-filtering the pattern.
             float  rayFoot = length(dgdt) * stepSize * 0.5;                 // 0.5: guv = g*0.5+0.5
-            float  scrFoot = max(length(ddx(g)), length(ddy(g))) * 0.5;
+            // 1.25 floor: filtering exactly at the screen Nyquist is borderline by definition;
+            // a quarter over costs almost nothing through trilinear mip blending. The reduced-
+            // resolution widening stacks on top via the global.
+            float  scrFoot = max(length(ddx(g)), length(ddy(g))) * 0.5
+                             * max(_StageBeamGoboFilterWiden, 1.25);
             float  foot    = max(rayFoot, scrFoot);
             // Isotropic on purpose — we want the shafts filtered, not anisotropically preserved.
             float2 footX = float2(foot, 0.0);
@@ -277,14 +409,22 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
         float phase = 1.0;
         if (usePhase)
         {
-            float pLen = max(length(p3), 1e-4);
-            float cosT = dot(p3 / pLen, -rayCL);
+            // Direction the light actually travels: from the VIRTUAL apex, not the lens centre.
+            // normalize(p3) degenerates at the root (p3 → 0), which made the phase term flicker
+            // exactly where the camera gets close to the fixture; relApex never collapses.
+            float pLen = max(length(relApex), 1e-4);
+            float cosT = dot(relApex / pLen, -rayCL);
             // pow(x, 1.5) = x * sqrt(x); the latter is a mul + rsqrt vs pow's log/exp.
             float d = abs(1.0 + phaseG2 - 2.0 * phaseG * cosT);
             phase = (1.0 - phaseG2) / (d * sqrt(d));
         }
 
         float base  = inAxis * side * hotFactor * axialAtt * gobo * hazeF * phase;
+
+        // Camera-side twin of the surface contact fade below: the first stretch in front of the
+        // eye eases in, so flying the camera into a beam meets fog it enters rather than a lit
+        // wall it clips through. At NearFade 0 the multiplier saturates to 1 — a no-op.
+        base *= saturate(t * invNearFade);
 
         if (depthClipped)
         {
@@ -310,11 +450,20 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
         float boost = rootBoost - 1.0;
         float bC = 1.0 + boost * (1.0 - p.rootWhite);   // colour weight (was recomputed ×3)
         float bW = boost * p.rootWhite;                  // white weight (was recomputed ×2)
-        sum        += base * bC;
-        whiteSum   += base * bW;
+        sum        += base * bC * trans;
+        whiteSum   += base * bW * trans;
         float baseNM = baseRaw / hazeF;
-        sumNH      += baseNM * bC;
-        whiteSumNH += baseNM * bW;
+        sumNH      += baseNM * bC * trans;
+        whiteSumNH += baseNM * bW * trans;
+
+        // Extinction over this step. Proportional to the haze actually present: the beam's own
+        // density, the noise field's local thickening, and nothing at all outside the cone, so a
+        // ray crossing empty stage between two beams is not attenuated by either.
+        if (_StageBeamExtinction > 1e-5)
+        {
+            trans *= exp(-_StageBeamExtinction * p.density * hazeF * inAxis * stepSize);
+            if (trans < 0.002) break;   // nothing behind this can still register
+        }
     #if defined(_STAGEBEAM_SHADOWS_VOLUME)
         // sumRaw feeds ONLY the shadow-debug view — accumulate it only when that's on, not every
         // sample of every production frame.

@@ -60,6 +60,12 @@ Shader "Origuma/StageBeamUpsample"
                 float2 p  = uv * res;                    // pixel position in low-res texel units
                 float2 tc = floor(p) + 0.5;              // nearest low-res texel center
 
+                // NO luminance guard here, deliberately — it was tried and reverted. This pass
+                // MAGNIFIES buffer texels to screen pixels, so a structure-preserving weight
+                // faithfully reproduces the buffer's texel STAIRCASE and the image reads as
+                // blocks; smoothing across texels is this filter's actual job. Structure
+                // preservation belongs one stage earlier, in the denoise pass, which runs at
+                // the buffer's own resolution where "structure" cannot be grid blocks.
                 half4 sum = 0;
                 float wSum = 0.0;
                 half4 nearestC = 0;
@@ -162,6 +168,7 @@ Shader "Origuma/StageBeamUpsample"
                 float2 d  = _BeamUpsampleTexelSize.xy;
 
                 float z0 = LinearEyeDepth(SampleSceneDepth(uv), _ZBufferParams);
+                half4 c0 = SAMPLE_TEXTURE2D_X_LOD(_BlitTexture, sampler_LinearClamp, uv, 0);
 
                 half4 sum = 0;
                 float wSum = 0.0;
@@ -179,12 +186,22 @@ Shader "Origuma/StageBeamUpsample"
                         float wS  = exp(-(i * i + j * j) * 0.22);                 // wider gaussian
                         float rel = abs(zi - z0) / max(z0, 1e-3);
                         float wD  = exp(-rel * 16.0);                             // silhouette guard
-                        float w = wS * wD;
+                        // Range guard on ALPHA, not on rgb luminance. Alpha carries the pure
+                        // beam baseline — no haze, no shadow — so everything worth preserving
+                        // (gobo shafts, cone rims) steps in alpha, while the shadow-jitter
+                        // grain this pass exists to remove lives ONLY in the rgb/alpha ratio
+                        // and leaves alpha flat. An rgb-luminance guard was tried first and
+                        // mistook that grain (also a many-fold step) for structure, which
+                        // un-denoised the volume shadows; keyed to alpha, shadow grain smooths
+                        // exactly as it did before the guard existed and shafts still hold.
+                        float dRel = abs((float)c.a - (float)c0.a) / (max((float)c0.a, (float)c.a) + 1e-4);
+                        float wR  = exp(-dRel * dRel * 6.0);
+                        float w = wS * wD * wR;
                         sum  += c * w;
                         wSum += w;
                     }
                 }
-                return wSum > 1e-4 ? sum / wSum : SAMPLE_TEXTURE2D_X_LOD(_BlitTexture, sampler_LinearClamp, uv, 0);
+                return wSum > 1e-4 ? sum / wSum : c0;
             }
             ENDHLSL
         }

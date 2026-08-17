@@ -1199,8 +1199,22 @@ namespace Origuma.StageBeam
                 // A hinted subtree already contributed its authored shape via the compute splat —
                 // rasterizing it too would double the occupancy and cost a draw call per renderer.
                 bool hinted = _hintCovered != null && i < _hintCovered.Length && _hintCovered[i];
-                _voxelizeFlags[i] = active && !hinted &&
-                    (MaxOccluderSize <= 0f || r.bounds.extents.magnitude * 2f <= MaxOccluderSize);
+                // Size gate. Skinned meshes must NOT be judged by r.bounds: cloth/culling systems
+                // (MagicaCloth among them) inflate skinned bounds on purpose, and the raw test
+                // silently rejected a whole performer as "floor-sized" — the character then cast
+                // no mesh occupancy at all and the shadow degraded to the union of whatever small
+                // accessory renderers still fit under the cap, which reads as a cluster of balls.
+                // GatherOccluders documents this exact trap for the AutoFit path (bone positions,
+                // never renderer bounds); this is the same rule applied to raster eligibility.
+                bool sizeOk = MaxOccluderSize <= 0f;
+                if (!sizeOk && active)
+                {
+                    if (r is SkinnedMeshRenderer sk && TryComputeSkeletonBounds(sk, out var skel))
+                        sizeOk = skel.extents.magnitude * 2f <= MaxOccluderSize;
+                    else
+                        sizeOk = r.bounds.extents.magnitude * 2f <= MaxOccluderSize;
+                }
+                _voxelizeFlags[i] = active && !hinted && sizeOk;
 
                 if (_voxelizeFlags[i]) _statOccluders++;
 

@@ -66,10 +66,32 @@ namespace Origuma.StageBeam.Editor
 
             var p = b.Profiler;
             var sb = new System.Text.StringBuilder();
-            sb.Append($"  gpu timing           : {p.TotalMs:0.000} ms total");
+            sb.Append($"  gpu timing           : {p.TotalMs:0.000} ms total (sum of medians)");
             foreach (var name in p.PassOrder)
-                sb.Append($"\n      {name,-16} {p.GetMs(name):0.000} ms");
+            {
+                if (!p.TryGetStats(name, out var min, out var med, out var max, out var n)) continue;
+                // Median first because that is the figure to compare across builds; the min-max
+                // span beside it is what says whether a difference is worth believing. Read as a
+                // single number, this pass has been seen at 0.163 and 0.323 ms in the same minute
+                // doing identical work — a 30% "regression" is inside that.
+                sb.Append($"\n      {name,-16} med {med:0.000}  min {min:0.000}  max {max:0.000}" +
+                          $"  (n={n}, spread {(med > 0 ? (max - min) / med * 100.0 : 0):0}%)");
+            }
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// Start the timing window over. Use it when changing something mid-session, so the
+        /// readings that follow describe one configuration instead of a blend of two.
+        /// </summary>
+        [MenuItem("Window/Origuma/Stage Beam/Reset Occlusion Timing Window", false, 203)]
+        private static void ResetTimings()
+        {
+            var b = StageBeamOcclusionBuilder.ActiveDebug;
+            if (b == null) { Debug.LogWarning("[StageBeam] No occlusion builder is active."); return; }
+            b.Profiler.ResetWindow();
+            Debug.Log("<color=#5aa9e6>[StageBeam]</color> Occlusion timing window cleared — " +
+                      "give it a few seconds of Play before reading the cost report.");
         }
 
         [MenuItem("Window/Origuma/Stage Beam/Toggle Occlusion GPU Profiling", false, 202)]
