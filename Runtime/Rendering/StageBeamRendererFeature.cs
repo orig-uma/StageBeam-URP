@@ -118,10 +118,17 @@ namespace Origuma.StageBeam
         [Tooltip("ONE dial for \"beams vs scene\": multiplies every beam's volumetric brightness " +
                  "(and the projected pools) without touching per-fixture intensities. The low " +
                  "default keeps performers/characters readable inside beams; raise for a " +
-                 "heavier haze look. Raise it alongside Anisotropy and the Physical Beam " +
-                 "Model — both redistribute brightness rather than add it, so beams come out " +
-                 "dimmer from the usual viewing angles.")]
-        [Range(0f, 2f)] [SerializeField] private float _masterIntensity = 0.1f;
+                 "heavier haze look. Raise it alongside the Physical Beam Model, which " +
+                 "redistributes brightness rather than adding it, so beams come out dimmer " +
+                 "from the usual viewing angles. Anisotropy no longer needs this — a beam seen " +
+                 "side-on holds its brightness at any setting.")]
+        // 0.1 -> 0.08 for new assets, following two changes that each moved the exposure of a
+        // default fixture (Anisotropy 0.6, Hotspot 1) seen side-on:
+        //   phase normalisation  x2.48 brighter (side-on was 0.404 of isotropic, now exactly 1)
+        //   Hotspot in the bell  x0.5  dimmer   ((1 + Hotspot) x bell became bell^Hotspot)
+        // Net x1.24, so 0.1 / 1.24 = 0.08 lands a default beam back where it already sat. Assets
+        // saved before this keep their 0.1 and come out 24% brighter — a nudge, not a re-tune.
+        [Range(0f, 2f)] [SerializeField] private float _masterIntensity = 0.08f;
 
         // ONE dial for how physical the beam model is (was briefly three: photometric profile,
         // physical falloff, edge diffusion). Every mixed combination read as an incoherent look —
@@ -139,6 +146,17 @@ namespace Origuma.StageBeam
         [Tooltip("Metres over which a beam eases back in just in front of the camera, so " +
                  "flying the camera into a beam meets fog instead of a hard bright wall. 0 = off.")]
         [Range(0f, 3f)] [SerializeField] private float _nearFade = 0.35f;
+
+        // Mixes each fixture's Anisotropy lobe toward isotropic. A single Henyey-Greenstein lobe
+        // describes ONE bounce; in haze thick enough to show beams, much of what reaches the eye
+        // has bounced repeatedly, and the limit of that is isotropic. A property of the room, not
+        // of a fixture, so it lives here rather than in the Look. Default 0 = single scattering,
+        // exactly as before this existed.
+        [Tooltip("How much of the haze glow has bounced more than once. 0 = none. 0.1-0.25 gives " +
+                 "thick haze the soft halo it carries around a beam and stops beams pointed away " +
+                 "from the camera going flat. Raise it together with fixture Density — thin haze " +
+                 "genuinely does not do this.")]
+        [Range(0f, 1f)] [SerializeField] private float _multiScatter = 0f;
 
         [Header("Haze Noise (optional)")]
         [Tooltip("Tileable 3D noise that modulates beam density to look like drifting atmosphere. " +
@@ -290,6 +308,7 @@ namespace Origuma.StageBeam
         private static readonly int IdEdgeAntiAlias    = Shader.PropertyToID("_StageBeamEdgeAA");
         private static readonly int IdPhysicalModel    = Shader.PropertyToID("_StageBeamPhysical");
         private static readonly int IdNearFade         = Shader.PropertyToID("_StageBeamNearFade");
+        private static readonly int IdMultiScatter     = Shader.PropertyToID("_StageBeamMultiScatter");
         private static readonly int IdGoboFilterWiden  = Shader.PropertyToID("_StageBeamGoboFilterWiden");
         private static readonly int IdHazeExtinction   = Shader.PropertyToID("_StageBeamExtinction");
         private static readonly int IdBeamTauTex       = Shader.PropertyToID("_BeamTauTex");
@@ -539,6 +558,7 @@ namespace Origuma.StageBeam
             Shader.SetGlobalFloat(IdEdgeAntiAlias, _edgeAntiAlias);
             Shader.SetGlobalFloat(IdPhysicalModel, _physicalModel);
             Shader.SetGlobalFloat(IdNearFade, _nearFade);
+            Shader.SetGlobalFloat(IdMultiScatter, _multiScatter);
             // Gobo prefilter widening: 1 at Full, ~1.08 / 1.25 / 1.5 / 1.75 at ThreeQuarter /
             // Half / Third / Quarter.
             // The march's mip footprint targets exactly the sampling rate; when the buffer is

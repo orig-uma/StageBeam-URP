@@ -45,7 +45,9 @@ namespace Origuma.StageBeam
                  "washes die near the fixture — and the source end never changes, only the tail.")]
         [Range(0f, 5f)] public float AxialFalloff;
 
-        [Tooltip("How much brighter the core is than the outer field. 0 = flat across the beam.")]
+        [Tooltip("How tightly the light bunches into the core. 0 = flat across the whole field. " +
+                 "1 = the fixture's own photometrics — half brightness at its beam angle, a tenth " +
+                 "at its field angle. Above 1 for a harder core than the real optics give.")]
         [Range(0f, 4f)] public float Hotspot;
 
         // One dial where there were three (strength / reach / white bias). This is the ONLY
@@ -81,11 +83,11 @@ namespace Origuma.StageBeam
         /// isotropic beams are the flatter-looking outlier. It had defaulted to 0 only because the
         /// control was never wired into the rig path, so nobody had seen it on.
         ///
-        /// Turning it on DIMS the ordinary view. The phase function is 1.0 in every direction at
-        /// g = 0, but at g = 0.6 a beam seen side-on scatters (1-g²)/(1+g²)^1.5 = 0.40 of that,
-        /// while only near head-on does it gain. Master Intensity's default is raised by the
-        /// reciprocal, 2.48x, so a side-on beam sits where it always did and the head-on flare is
-        /// the part that changes.
+        /// It is exposure-neutral: the phase function is normalised so a beam seen SIDE-ON reads
+        /// 1.0 at every g, and only the head-on flare (and the fall-off behind) changes with the
+        /// dial. That normalisation is what makes this safe to vary per fixture — the raw
+        /// Henyey-Greenstein is 0.40 side-on at g = 0.6, so one fixture set differently from the
+        /// rest would otherwise land 2.5x off, and Master, being global, could not put it back.
         /// </summary>
         public static StageBeamLook Default => new StageBeamLook
         {
