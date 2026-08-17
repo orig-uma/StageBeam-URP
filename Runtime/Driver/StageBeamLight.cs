@@ -78,19 +78,32 @@ namespace Origuma.StageBeam
         // --- Superseded by Look, kept only so existing scenes and prefabs carry their values over.
         // Each maps from the field name it had when it lived here, so a scene authored before the
         // struct still deserialises; MigrateLook copies them across exactly once.
-        [SerializeField, HideInInspector, FormerlySerializedAs("Density")]        private float _oldDensity = 1f;
-        [SerializeField, HideInInspector, FormerlySerializedAs("Anisotropy")]     private float _oldAnisotropy;
-        [SerializeField, HideInInspector, FormerlySerializedAs("AxialFalloff")]   private float _oldAxialFalloff = 1f;
-        [SerializeField, HideInInspector, FormerlySerializedAs("Hotspot")]        private float _oldHotspot = 1f;
-        [SerializeField, HideInInspector, FormerlySerializedAs("RootBoost")]      private float _oldRootBoost;
-        [SerializeField, HideInInspector, FormerlySerializedAs("RaymarchSteps")]  private int   _oldRaymarchSteps = 24;
-        [SerializeField, HideInInspector, FormerlySerializedAs("DepthOcclude")]   private bool  _oldDepthOcclude = true;
+        //
+        // INITIALISED FROM THE STRUCT, never with a literal. A scene that predates the struct has
+        // every one of these keys in its YAML, so its own values win and these initialisers are
+        // dead — they are reached ONLY by a component that never had the old fields, i.e. a fresh
+        // one, whose Look then has to come out identical to StageBeamLook.Default. Written as
+        // literals they had already drifted from it in two places (Anisotropy 0 vs 0.6,
+        // RaymarchSteps 24 vs 48), so every StageBeamLight added after the struct landed was
+        // migrated straight back off the defaults it was born with — isotropic scattering and
+        // half the samples, silently, on the exact path this struct exists to keep consistent.
+        [SerializeField, HideInInspector, FormerlySerializedAs("Density")]        private float _oldDensity = StageBeamLook.Default.Density;
+        [SerializeField, HideInInspector, FormerlySerializedAs("Anisotropy")]     private float _oldAnisotropy = StageBeamLook.Default.Anisotropy;
+        [SerializeField, HideInInspector, FormerlySerializedAs("AxialFalloff")]   private float _oldAxialFalloff = StageBeamLook.Default.AxialFalloff;
+        [SerializeField, HideInInspector, FormerlySerializedAs("Hotspot")]        private float _oldHotspot = StageBeamLook.Default.Hotspot;
+        [SerializeField, HideInInspector, FormerlySerializedAs("RootBoost")]      private float _oldRootBoost = StageBeamLook.Default.RootGlare;
+        [SerializeField, HideInInspector, FormerlySerializedAs("RaymarchSteps")]  private int   _oldRaymarchSteps = StageBeamLook.Default.RaymarchSteps;
+        [SerializeField, HideInInspector, FormerlySerializedAs("DepthOcclude")]   private bool  _oldDepthOcclude = StageBeamLook.Default.DepthOcclude;
         [SerializeField, HideInInspector] private bool _lookMigrated;
 
         /// <summary>
         /// One-shot copy of the pre-struct fields into <see cref="Look"/>. Safe to run on a fresh
-        /// component because the legacy defaults are the struct's defaults; the flag exists so a
-        /// look edited AFTER migrating is never stomped by a second pass.
+        /// component because the legacy defaults are taken FROM the struct's defaults above; the
+        /// flag exists so a look edited AFTER migrating is never stomped by a second pass.
+        ///
+        /// Does not repair a component that already migrated under the drifted literals — its
+        /// Look and its migrated flag are both serialised by then. Those need the value set by
+        /// hand (or the component re-added).
         /// </summary>
         private void MigrateLook()
         {
