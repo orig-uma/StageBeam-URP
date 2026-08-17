@@ -57,6 +57,9 @@ Shader "Origuma/StageBeamCone"
             #pragma multi_compile _ _STAGEBEAM_SHADOWS_SCREEN _STAGEBEAM_SHADOWS_VOLUME _STAGEBEAM_SHADOWS_LIGHT
             #pragma multi_compile_fragment _ _ADDITIONAL_LIGHT_SHADOWS
             #pragma multi_compile_fragment _ _SHADOWS_SOFT
+            // Adds the optical-depth target so the composite can darken the background. Off = a
+            // single-target pass, identical to before the feature existed.
+            #pragma multi_compile_fragment _ _STAGEBEAM_TRANSMITTANCE
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
             #include "StageBeamShadow.hlsl"
@@ -127,7 +130,7 @@ Shader "Origuma/StageBeamCone"
             // fragments would cancel each other out.
             float  _BeamSoft;
 
-            half4 frag (Varyings i) : SV_Target
+            void frag (Varyings i, STAGEBEAM_TARGETS)
             {
                 // Object space has the beam axis along -Y; remap to a frame whose axis is +Z so the
                 // cone test is axis-aligned (object scale 1, so CL distances == world distances).
@@ -135,7 +138,7 @@ Shader "Origuma/StageBeamCone"
                 float3 exitWS = i.positionWS;
                 float3 rayWS  = exitWS - camWS;
                 float  segLen = length(rayWS);
-                if (segLen < 1e-4) return 0;
+                if (segLen < 1e-4) { STAGEBEAM_WRITE(0, 0); return; }
                 float3 dirWS = rayWS / segLen;
 
                 float3 camOS  = TransformWorldToObject(camWS);
@@ -170,8 +173,10 @@ Shader "Origuma/StageBeamCone"
                 p.goboRot2        = _GoboRotation2;
                 p.beamSoft        = _BeamSoft;
 
-                return StageBeamRaymarch(p, camWS, dirWS, camCL, rayCL, exitCL,
-                                         lightWS, i.positionHCS.xy);
+                float tau;
+                half4 col = StageBeamRaymarch(p, camWS, dirWS, camCL, rayCL, exitCL,
+                                              lightWS, i.positionHCS.xy, tau);
+                STAGEBEAM_WRITE(col, tau);
             }
             ENDHLSL
         }
@@ -196,6 +201,9 @@ Shader "Origuma/StageBeamCone"
             #pragma multi_compile _ _STAGEBEAM_SHADOWS_SCREEN _STAGEBEAM_SHADOWS_VOLUME _STAGEBEAM_SHADOWS_LIGHT
             #pragma multi_compile_fragment _ _ADDITIONAL_LIGHT_SHADOWS
             #pragma multi_compile_fragment _ _SHADOWS_SOFT
+            // Adds the optical-depth target so the composite can darken the background. Off = a
+            // single-target pass, identical to before the feature existed.
+            #pragma multi_compile_fragment _ _STAGEBEAM_TRANSMITTANCE
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
             #include "StageBeamShadow.hlsl"
@@ -290,13 +298,13 @@ Shader "Origuma/StageBeamCone"
                 return o;
             }
 
-            half4 frag (Varyings i) : SV_Target
+            void frag (Varyings i, STAGEBEAM_TARGETS)
             {
                 float3 camWS  = GetCameraPositionWS();
                 float3 exitWS = i.positionWS;
                 float3 rayWS  = exitWS - camWS;
                 float  segLen = length(rayWS);
-                if (segLen < 1e-4) return 0;
+                if (segLen < 1e-4) { STAGEBEAM_WRITE(0, 0); return; }
                 float3 dirWS = rayWS / segLen;
 
                 float3 camCL  = float3(i.camOS.x,  i.camOS.z,  -i.camOS.y);
@@ -328,8 +336,10 @@ Shader "Origuma/StageBeamCone"
                 p.goboRot2        = i.c5.w;
                 p.beamSoft        = _BeamSoft;
 
-                return StageBeamRaymarch(p, camWS, dirWS, camCL, rayCL, exitCL,
-                                         i.lightWS, i.positionHCS.xy);
+                float tau;
+                half4 col = StageBeamRaymarch(p, camWS, dirWS, camCL, rayCL, exitCL,
+                                              i.lightWS, i.positionHCS.xy, tau);
+                STAGEBEAM_WRITE(col, tau);
             }
             ENDHLSL
         }

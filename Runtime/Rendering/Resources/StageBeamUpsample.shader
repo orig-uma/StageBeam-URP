@@ -7,7 +7,16 @@ Shader "Origuma/StageBeamUpsample"
         Pass
         {
             Name "BeamUpsample"
-            Blend One One
+            // dst = src.rgb + dst * src.a — scattered light adds, and the alpha the fragment
+            // returns is the beam stack's TRANSMITTANCE, so the background behind a beam is
+            // dimmed by the haze it is seen through. With transmittance off the shader returns
+            // a = 1 and this is bit-for-bit the plain additive composite it replaced.
+            Blend One SrcAlpha
+            // The alpha is a blend FACTOR, not a value the camera wants. Masking the write keeps
+            // it out of the destination while the RGB blend still reads it — without this the pass
+            // would push transmittance into the camera's alpha channel, which downstream post
+            // (and anything compositing the camera output) reads as coverage.
+            ColorMask RGB
             ZWrite Off
             ZTest Always
             Cull Off
@@ -30,6 +39,13 @@ Shader "Origuma/StageBeamUpsample"
 
             // Anti-banding dither amplitude, as a FRACTION OF THE PIXEL'S VALUE. 0 = off.
             float _BeamDither;
+
+            // Optical depth accumulated by the beam passes (second MRT target, summed additively
+            // across every beam — see StageBeamConeCore.hlsl). 0 = this composite has no depth
+            // target bound (the decal/pool composite reuses this pass), so it returns a = 1 and
+            // the blend degenerates to plain additive.
+            TEXTURE2D_X(_BeamTauTex);
+            float _BeamTransmittance;
 
             // Interleaved gradient noise — a low-discrepancy per-pixel value, matched to what the
             // cone's raymarch jitter uses.
@@ -70,6 +86,13 @@ Shader "Origuma/StageBeamUpsample"
                 float wSum = 0.0;
                 half4 nearestC = 0;
                 float nearestDiff = 1e30;
+                // Optical depth rides the SAME bilateral weights as the colour. It must: if the
+                // two were filtered differently, a silhouette pixel could take its scattered light
+                // from the near side of the edge and its occlusion from the far side, and the beam
+                // would darken a surface it does not cover.
+                float tauSum = 0.0;
+                float nearestTau = 0.0;
+                bool  useTau = _BeamTransmittance > 0.0;
 
                 UNITY_UNROLL
                 for (int j = -1; j <= 1; j++)
@@ -94,14 +117,24 @@ Shader "Origuma/StageBeamUpsample"
                         sum  += col * w;
                         wSum += w;
 
+                        float tj = useTau
+                            ? SAMPLE_TEXTURE2D_X_LOD(_BeamTauTex, sampler_LinearClamp, suv, 0).r
+                            : 0.0;
+                        tauSum += tj * w;
+
                         float diff = abs(zi - z0);
-                        if (diff < nearestDiff) { nearestDiff = diff; nearestC = col; }
+                        if (diff < nearestDiff)
+                        {
+                            nearestDiff = diff; nearestC = col; nearestTau = tj;
+                        }
                     }
                 }
 
                 // No neighbour matched this pixel's depth (thin feature the half-res grid
                 // stepped over) → take the single closest-depth texel instead of a bleed.
-                half4 outc = wSum > 1e-3 ? sum / wSum : nearestC;
+                bool  matched = wSum > 1e-3;
+                half4 outc = matched ? sum / wSum : nearestC;
+                float tau  = matched ? tauSum / wSum : nearestTau;
                 if (_BeamSoftCeiling > 0.0)
                 {
                     // Modulation-preserving ceiling. rgb = full beam total (haze × shadow),
@@ -132,6 +165,12 @@ Shader "Origuma/StageBeamUpsample"
                     float d = BeamIGN(input.positionCS.xy) - 0.5;
                     outc.rgb *= 1.0 + d * _BeamDither;
                 }
+
+                // Alpha stops being the modulation baseline here and becomes the BLEND FACTOR the
+                // pass declares (Blend One SrcAlpha): the transmittance of every beam stacked in
+                // front of this pixel. The baseline's only two consumers — the ceiling above and
+                // the denoise pass before it — have both already run, so the channel is free.
+                outc.a = useTau ? exp(-tau) : 1.0;
                 return outc;
             }
             ENDHLSL

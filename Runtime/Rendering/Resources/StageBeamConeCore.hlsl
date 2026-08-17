@@ -131,13 +131,34 @@ float BeamEntryDistance(float3 ro, float3 rd, float zEnd, float rStart, float rE
     return best;
 }
 
+// --- Transmittance MRT ------------------------------------------------------------------------
+// With _STAGEBEAM_TRANSMITTANCE on, every beam pass writes a SECOND target carrying the optical
+// depth its haze puts in front of the pixel, so the composite can darken the background the beam
+// stands in front of. Optical depth is the quantity that makes this work with additive blending:
+// transmittance MULTIPLIES between beams (T = T1·T2), which One One cannot express, but the depths
+// it comes from ADD (τ = τ1+τ2, T = exp(-τ)) — so the same accumulation buffer that sums scattered
+// light also sums occlusion, exactly, with no ordering and no extra pass.
+//
+// Behind a keyword because the alternative is worse than a branch: target 1 has to be BOUND, so a
+// permanently-MRT shader would force the offscreen route (and its buffer) on every project whether
+// or not it uses extinction. Keyword off = byte-identical to a single-target beam pass.
+#if defined(_STAGEBEAM_TRANSMITTANCE)
+    #define STAGEBEAM_TARGETS   out half4 outColor : SV_Target0, out float outTau : SV_Target1
+    #define STAGEBEAM_WRITE(c, t)  { outColor = (c); outTau = (t); }
+#else
+    #define STAGEBEAM_TARGETS   out half4 outColor : SV_Target0
+    #define STAGEBEAM_WRITE(c, t)  { outColor = (c); }
+#endif
+
 // The full cone raymarch. camCL/rayCL/exitCL are the camera origin, ray direction and hull exit
 // in the beam's CL frame (axis = +Z, object scale 1 so distances == world). lightWS is the beam
 // apex in world space (shadow origin). screenPix = fragment pixel coords (for depth UV + jitter).
+// opticalDepth returns the beam's own τ over the marched span, for the transmittance target above.
 half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
                         float3 camCL, float3 rayCL, float3 exitCL,
-                        float3 lightWS, float2 screenPix)
+                        float3 lightWS, float2 screenPix, out float opticalDepth)
 {
+    opticalDepth = 0.0;   // set before every early-out below: an unwritten out is undefined
     float tanField    = max(tan(p.fieldHalf), 1e-3);
     float radiusStart = p.startRadius;
     float radiusEnd   = p.range * tanField + p.startRadius;
@@ -461,7 +482,15 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
         // ray crossing empty stage between two beams is not attenuated by either.
         if (_StageBeamExtinction > 1e-5)
         {
-            trans *= exp(-_StageBeamExtinction * p.density * hazeF * inAxis * stepSize);
+            // One depth for both halves of Beer-Lambert: `trans` dims the samples BEHIND this one
+            // on the way to the eye, `opticalDepth` accumulates the same thickness for the
+            // composite to dim the BACKGROUND with. Sharing the term keeps them consistent by
+            // construction — a beam can never look thick from the front and thin from behind.
+            float dTau = _StageBeamExtinction * p.density * hazeF * inAxis * stepSize;
+            opticalDepth += dTau;
+            trans *= exp(-dTau);
+            // Bails at τ ≈ 6.2, where the background is already 99.8% extinguished, so the depth
+            // this stops accumulating cannot change the composite.
             if (trans < 0.002) break;   // nothing behind this can still register
         }
     #if defined(_STAGEBEAM_SHADOWS_VOLUME)

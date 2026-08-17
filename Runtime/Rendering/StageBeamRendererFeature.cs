@@ -149,14 +149,22 @@ namespace Origuma.StageBeam
         [Tooltip("Haze turbulence amount. 0 = off (uniform beam).")]
         [Range(0f, 1f)] [SerializeField] private float _hazeStrength = 0f;
 
-        // View-ray half of Beer-Lambert only. Beams cannot darken what is behind them here: the
-        // pass blends additively, so background occlusion would need alpha coverage and a different
-        // composite.
-        [Tooltip("How much the haze dims a beam over distance toward the camera, per metre. " +
-                 "0 = every sample counts equally, so density only makes a beam brighter and " +
-                 "whiter. 0.02-0.05 gives a beam a visible front and back; higher reads as thick " +
-                 "smoke. Does not darken objects behind the beam.")]
-        [Range(0f, 0.3f)] [SerializeField] private float _hazeExtinction = 0f;
+        // Both halves of Beer-Lambert: samples dim on the way to the eye, AND the accumulated
+        // optical depth dims the background through a second MRT target (StageBeamConeCore.hlsl).
+        // Above 0 the beams are forced through the offscreen composite, which is what owns the
+        // transmittance blend — so this is also the switch between two render routes.
+        //
+        // The ceiling is 1.0 rather than the 0.3 it launched with: at 0.3/m a beam has to be ~8 m
+        // deep before it occludes anything worth seeing, which put the whole interesting range in
+        // the top tenth of the slider. New assets default to 0.05 (visible front-to-back without
+        // reading as smoke); assets saved before this field existed keep their serialized 0 and so
+        // keep their exact look until someone raises it.
+        [Tooltip("How much the haze dims light passing through it, per metre. 0 = beams are pure " +
+                 "additive glow: no front-to-back, and nothing behind them is dimmed. 0.02-0.1 " +
+                 "gives a beam a visible near and far side and lets it darken the background it " +
+                 "crosses, which is what makes an edge read against a bright set. Higher is thick " +
+                 "smoke. Above 0 beams render through the offscreen buffer.")]
+        [Range(0f, 1f)] [SerializeField] private float _hazeExtinction = 0.05f;
         [Tooltip("World units → noise size. Smaller = larger, softer blobs.")]
         [SerializeField] private float _hazeScale = 0.3f;
         [Tooltip("Drift velocity of the haze in world units per second.")]
@@ -284,6 +292,9 @@ namespace Origuma.StageBeam
         private static readonly int IdNearFade         = Shader.PropertyToID("_StageBeamNearFade");
         private static readonly int IdGoboFilterWiden  = Shader.PropertyToID("_StageBeamGoboFilterWiden");
         private static readonly int IdHazeExtinction   = Shader.PropertyToID("_StageBeamExtinction");
+        private static readonly int IdBeamTauTex       = Shader.PropertyToID("_BeamTauTex");
+        private static readonly int IdBeamTransmittance = Shader.PropertyToID("_BeamTransmittance");
+        private const string KeywordTransmittance = "_STAGEBEAM_TRANSMITTANCE";
 
         public override void Create()
         {
@@ -313,6 +324,10 @@ namespace Origuma.StageBeam
         }
 
         private float ResolutionDivisor => 1f / Mathf.Clamp(_resolutionFactor, 0.25f, 1f);
+
+        // Needs the upsample material: the transmittance blend lives in that composite pass, and
+        // without it there is nothing to apply the accumulated depth with.
+        private bool TransmittanceOn => _hazeExtinction > 1e-5f && _upsampleMat != null;
 
         protected override void Dispose(bool disposing)
         {
@@ -531,6 +546,10 @@ namespace Origuma.StageBeam
             // moire, so filter slightly below the rate the smaller the buffer gets.
             Shader.SetGlobalFloat(IdGoboFilterWiden, 0.75f + 0.25f * ResolutionDivisor);
             Shader.SetGlobalFloat(IdHazeExtinction, _hazeExtinction);
+            // Drives the beam passes' second (optical-depth) target, the offscreen routing and the
+            // composite's blend. The KEYWORD it implies is set per-pass in DrawBeams, not here —
+            // see the comment there.
+            bool transmittance = TransmittanceOn;
             Shader.SetGlobalFloat(IdTemporalJitter, _temporalJitter ? 1f : 0f);
 
             // Screen-space velocity (pixels/sec) the raymarch dither drifts at, matched to the
@@ -584,6 +603,7 @@ namespace Origuma.StageBeam
             }
 
             _pass.ResolutionDivisor   = _upsampleMat != null ? ResolutionDivisor : 1;
+            _pass.Transmittance       = transmittance;
             _pass.NoiseSmoothing      = _noiseSmoothing;
             _pass.Dither              = _dither;
             _pass.UpsampleMat         = _upsampleMat;
@@ -637,6 +657,7 @@ namespace Origuma.StageBeam
         {
             public float     Dither = 0.02f;          // anti-banding at the composite write
             public float     ResolutionDivisor = 1;   // 1 = full, 4/3 = three-quarter, 2 = half, …
+            public bool      Transmittance;           // beams write optical depth and dim the background
             public bool      NoiseSmoothing = true;
             public bool      AllowInstancing = true;   // false in LightShadowMap mode (see feature)
             public Material  UpsampleMat;
@@ -684,6 +705,8 @@ namespace Origuma.StageBeam
             private class BlitData
             {
                 public TextureHandle Source;
+                public TextureHandle Tau;    // optical depth; invalid when transmittance is off
+                public bool UseTau;
                 public Material Mat;
                 public int W, H;
                 public float SoftCeiling;
@@ -707,8 +730,11 @@ namespace Origuma.StageBeam
                 // Soft Additive needs the composite to see the SUMMED beam total (the ceiling
                 // curve can't be expressed per-beam), so it always routes through the offscreen
                 // buffer — at full resolution unless the resolution scale asked for less.
+                // Transmittance joins Soft Additive in forcing the offscreen route: the beam passes
+                // write a second target for it, which needs an attachment the camera colour has no
+                // slot for, and the blend that consumes it is the composite's.
                 float divisor = ResolutionDivisor;
-                if (divisor > 1.001f || StageBeamQueue.SoftComposite)
+                if (divisor > 1.001f || StageBeamQueue.SoftComposite || Transmittance)
                     RecordOffscreen(renderGraph, resources, camera, divisor);
                 else
                     RecordFullRes(renderGraph, resources, camera);
@@ -802,6 +828,11 @@ namespace Origuma.StageBeam
                         new Vector4(1f / d.W, 1f / d.H, d.W, d.H));
                     ctx.cmd.SetGlobalFloat(IdBeamSoftCeiling, d.SoftCeiling);
                     ctx.cmd.SetGlobalFloat(IdBeamDither, d.Dither);
+                    // Explicitly OFF, not just left unset: the beam composite ran earlier this
+                    // frame and the global is still 1: pools would then be multiplied into the
+                    // camera by the BEAM buffer's transmittance, which is not their occlusion.
+                    // A light pool is a surface reflection — it does not occlude anything.
+                    ctx.cmd.SetGlobalFloat(IdBeamTransmittance, 0f);
                     Blitter.BlitTexture(ctx.cmd, d.Source, new Vector4(1f, 1f, 0f, 0f), d.Mat, 0);
                 });
             }
@@ -865,6 +896,14 @@ namespace Origuma.StageBeam
             private void DrawBeams(RasterGraphContext ctx, int w, int h)
             {
                 ctx.cmd.SetGlobalVector(IdBeamRTParams, new Vector4(1f / w, 1f / h, w, h));
+                // Recorded into the command buffer, NOT set with Shader.EnableKeyword during setup.
+                // The keyword decides whether the fragment declares SV_Target1, so it has to agree
+                // with the attachments THIS pass bound. Two renderer features with different
+                // extinction settings each run their own AddRenderPasses before either executes, so
+                // a globally-set keyword would carry the last one's answer into the other one's
+                // draw — a shader writing a target that pass never bound.
+                if (Transmittance) ctx.cmd.EnableShaderKeyword(KeywordTransmittance);
+                else               ctx.cmd.DisableShaderKeyword(KeywordTransmittance);
 
                 if (StageBeamQueue.Instancing && AllowInstancing)
                 {
@@ -982,12 +1021,27 @@ namespace Origuma.StageBeam
                 var offRes = UniversalRenderer.CreateRenderGraphTexture(
                     renderGraph, offDesc, "StageBeamOffscreen", true, FilterMode.Bilinear);
 
+                // Second target: the optical depth every beam puts in front of the pixel, summed
+                // by the same One One blend as the colour (depths add where transmittances would
+                // have had to multiply — see StageBeamConeCore.hlsl). RHalf, not R8: the march
+                // runs to τ ≈ 6, and quantising that to 256 steps banded the background darkening
+                // in exactly the wide smooth gradients this whole pass fights to keep clean.
+                TextureHandle tauRes = default;
+                if (Transmittance)
+                {
+                    var tauDesc = offDesc;
+                    tauDesc.colorFormat = RenderTextureFormat.RHalf;
+                    tauRes = UniversalRenderer.CreateRenderGraphTexture(
+                        renderGraph, tauDesc, "StageBeamOpticalDepth", true, FilterMode.Bilinear);
+                }
+
                 // Pass 1 — raymarch the beams into the offscreen target.
                 {
                     using var builder = renderGraph.AddRasterRenderPass<ConeData>(
                         "Stage Beams (offscreen)", out var data);
                     data.W = offW; data.H = offH;
                     builder.SetRenderAttachment(offRes, 0);
+                    if (Transmittance) builder.SetRenderAttachment(tauRes, 1);
                     builder.UseAllGlobalTextures(true);
                     if (resources.cameraDepthTexture.IsValid())
                         builder.UseTexture(resources.cameraDepthTexture);
@@ -1031,11 +1085,17 @@ namespace Origuma.StageBeam
                     using var builder = renderGraph.AddRasterRenderPass<BlitData>(
                         "Stage Beams (composite)", out var data);
                     data.Source = compositeSource;
+                    data.Tau    = tauRes;
+                    data.UseTau = Transmittance;
                     data.Mat    = UpsampleMat;
                     data.W = offW; data.H = offH;
                     data.SoftCeiling = StageBeamQueue.SoftComposite ? StageBeamQueue.SoftCeiling : 0f;
                     data.Dither = Dither;
                     builder.UseTexture(compositeSource);
+                    // The RAW depth target, not a denoised copy: τ carries no shadow term and no
+                    // gobo, so it has none of the stochastic grain the denoise pass exists for,
+                    // and the composite's own 3×3 bilateral tap is smoothing enough for it.
+                    if (Transmittance) builder.UseTexture(tauRes);
                     builder.UseAllGlobalTextures(true);
                     if (resources.cameraDepthTexture.IsValid())
                         builder.UseTexture(resources.cameraDepthTexture);
@@ -1048,6 +1108,8 @@ namespace Origuma.StageBeam
                             new Vector4(1f / d.W, 1f / d.H, d.W, d.H));
                         ctx.cmd.SetGlobalFloat(IdBeamSoftCeiling, d.SoftCeiling);
                         ctx.cmd.SetGlobalFloat(IdBeamDither, d.Dither);
+                        ctx.cmd.SetGlobalFloat(IdBeamTransmittance, d.UseTau ? 1f : 0f);
+                        if (d.UseTau) ctx.cmd.SetGlobalTexture(IdBeamTauTex, d.Tau);
                         Blitter.BlitTexture(ctx.cmd, d.Source, new Vector4(1f, 1f, 0f, 0f), d.Mat, 0);
                     });
                 }
