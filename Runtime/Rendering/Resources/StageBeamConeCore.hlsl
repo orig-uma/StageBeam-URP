@@ -323,16 +323,13 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
         // from it in practice.
         float sideSoftEff = sideSoftness + 0.25 * _StageBeamPhysical * axNorm;
         float edgeSoft = max(sideSoftEff, fwidth(edge) * _StageBeamEdgeAA);
-        // x(2-x), not the plain ramp this was: it meets the flat interior with ZERO slope, so the
-        // crease a linear ramp leaves at the inner end of the rim goes away. That crease is a
-        // slope step across a wide, low-gradient field — precisely the signal the eye resolves as
-        // a Mach band, and precisely what the dither at the composite cannot help with because it
-        // is in the geometry, not the quantisation.
-        //
-        // Deliberately NOT smoothstep, which would flatten the slope at the RIM as well: the rim's
-        // steepness is the edge, and softening it is the opposite of what the dial is for.
-        float sideRamp = saturate(edge / edgeSoft);
-        float side = sideRamp * (2.0 - sideRamp);
+        // Linear on purpose. This was briefly x(2-x), to meet the flat interior with zero slope
+        // and remove the crease a linear ramp leaves at the INNER end of the rim. The crease is
+        // real, but it had never been reported — it was inferred from reading the profile — and
+        // the replacement doubled the slope at the RIM (f'(0) = 2 against 1), which visibly
+        // hardened every beam edge. A speculative fix is not worth an observed regression, and
+        // softness here is EdgeSoftness's job, not the ramp shape's.
+        float side = saturate(edge / edgeSoft);
 
         float widthBeam = z * tanBeam + radiusStart;
         float rNorm = radial / max(widthAtZ, 1e-5);
