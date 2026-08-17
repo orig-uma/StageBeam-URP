@@ -482,11 +482,27 @@ half4 StageBeamRaymarch(BeamParams p, float3 camWS, float3 dirWS,
         // ray crossing empty stage between two beams is not attenuated by either.
         if (_StageBeamExtinction > 1e-5)
         {
+            // Thickness follows the beam's own SHAPE, not just its bounding cone. A pure
+            // `inAxis` weight — the volume is either fully hazed or empty — makes the throw
+            // opaque all the way to Range and out to the hull at FULL strength, including the
+            // faded tail and the soft rim where the beam is no longer visible at all. The
+            // fixture then reads as a black cone with a bright core inside it, widest and
+            // darkest exactly where it should have disappeared.
+            //
+            // Physically a real haze column WOULD occlude that evenly — but only because the
+            // rest of the room is hazed too, and here it isn't: this model puts haze inside
+            // beams and nowhere else (see `trans`'s note above), so an evenly-opaque cone is a
+            // beam-shaped hole in clean air rather than a thicker patch of a hazy room.
+            //
+            // Shape only — `side`, the throw, the gobo. Intensity, Master and the phase function
+            // stay out: how bright a beam is told to be, and which way it is being looked at,
+            // must not change how much it blocks.
+            float shape = inAxis * side * axialAtt * gobo;
             // One depth for both halves of Beer-Lambert: `trans` dims the samples BEHIND this one
             // on the way to the eye, `opticalDepth` accumulates the same thickness for the
             // composite to dim the BACKGROUND with. Sharing the term keeps them consistent by
             // construction — a beam can never look thick from the front and thin from behind.
-            float dTau = _StageBeamExtinction * p.density * hazeF * inAxis * stepSize;
+            float dTau = _StageBeamExtinction * p.density * hazeF * shape * stepSize;
             opticalDepth += dTau;
             trans *= exp(-dTau);
             // Bails at τ ≈ 6.2, where the background is already 99.8% extinguished, so the depth
