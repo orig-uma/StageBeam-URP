@@ -9,7 +9,7 @@ namespace Origuma.StageBeam
     /// pushes each beam into <see cref="StageBeamQueue"/> for the renderer feature to raymarch.
     ///
     /// This is the generic, source-agnostic half of the beam pipeline: it knows nothing about
-    /// MVR/DMX/GDTF. Any number of data sources (e.g. <c>StageBeamSource</c>, <see cref="StageBeamLight"/>)
+    /// where the beam data comes from. Any number of data sources (e.g. <see cref="StageBeamLight"/>)
     /// call <see cref="AddSource"/> at startup to feed it; the driver pulls from every registered
     /// source each frame.
     /// </summary>

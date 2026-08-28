@@ -13,7 +13,7 @@ URP 向けのボリュメトリック・ステージビーム描画器。`Script
 ## 特徴
 
 Renderer Feature を1つ足して `Stage Beam Light` を置くだけで動きます。既定値のまま最低限の見た目が
-成立し、影・ヘイズ・ゴボ・解像度などを段階的に積み増せます。データ駆動リグ（MVR/DMX/GDTF 等）からは
+成立し、影・ヘイズ・ゴボ・解像度などを段階的に積み増せます。外部のデータ駆動リグからは
 共通の `IStageBeamSource` 契約で同じレンダラーに供給できます。
 
 * **解析的レイマーチのコーンビーム:** 単位コーンを解析交差＋N ステップ積分で描画。Field/Beam 角、
@@ -78,8 +78,8 @@ https://github.com/orig-uma/StageBeam-URP.git#v0.1.0
 | Surface Projection | 床のライトプール（ゴボ×色をデカール投影）。Receiver Layer マスク、Shadow Hardness で遮蔽感を調整 |
 | Culling | 境界球による視錐台カリング＋画面投影半径カリング（遠く/画面外/極小を棄却） |
 | GPU Instancing | ゴボ群ごとに `DrawMeshInstancedProcedural`。灯数が多く CPU/ドローコールがボトルネックの時に効く（opt-in、既定 OFF） |
-| StageBeamLight | 手置きのドロップイン コンポーネント（MVR/DMX 知識不要、1 個 = 1 本） |
-| IStageBeamSource | データ駆動リグ（MVR/DMX/GDTF 等）から同じレンダラーへ供給する契約 |
+| StageBeamLight | 手置きのドロップイン コンポーネント（前提知識不要、1 個 = 1 本） |
+| IStageBeamSource | 外部のデータ駆動リグから同じレンダラーへ供給する契約 |
 | One-click Setup | `Window > Origuma > Stage Beam Setup` で Renderer Feature を追加/削除。ドライバとマテリアルは実行時に自動生成 |
 
 ## 使い方
@@ -99,14 +99,11 @@ https://github.com/orig-uma/StageBeam-URP.git#v0.1.0
 | [USAGE](Documentation~/USAGE.md) | 導入・Renderer Feature 設定・全パラメータ・影モード・負荷ガイド |
 | [PERFORMANCE](Documentation~/PERFORMANCE.md) | Soft Additive 合成モデルと最適化手法（共有影/間引き/GPU インスタンシング/実測） |
 | [ARCHITECTURE](Documentation~/ARCHITECTURE.md) | 内部構成・設計方針（レイヤ構成/コーンシェーダ/占有ボリューム） |
-| [LightBeamDesign](Documentation~/LightBeamDesign.md) | 描画系の設計定義（縮小バッファ/レイマーチング/性能予算/フェーズ計画） |
 
-## 関連パッケージ
+## 拡張
 
-このパッケージは単体で完結しますが、上位に **MVR/GDTF リグ + DMX**（`com.origuma.mvr-toolkit`）、
-**Art-Net / sACN I/O**（`com.origuma.dmx-toolkit`）、**Cue/Effect**（`com.origuma.show-control`）を
-重ねると、実際の照明卓のショーを駆動できます。いずれも `IStageBeamSource` を実装して同じレンダラーに
-供給する構成です。
+このパッケージは単体で完結します。上位に灯体リグやショー制御のレイヤーを重ねる場合も、
+`IStageBeamSource` を実装して同じレンダラーに供給する構成で拡張できます。
 
 ## ライセンス
 

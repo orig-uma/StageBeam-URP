@@ -3,8 +3,8 @@ using System.Collections.Generic;
 namespace Origuma.StageBeam
 {
     /// <summary>
-    /// Supplies the beams to draw each frame. Implemented by whatever owns the beam data (an
-    /// MVR/DMX rig, a procedural test, …) and injected into a <see cref="StageBeamDriver"/> via
+    /// Supplies the beams to draw each frame. Implemented by whatever owns the beam data (a
+    /// data-driven lighting rig, a procedural test, …) and injected into a <see cref="StageBeamDriver"/> via
     /// <see cref="StageBeamDriver.SetSource"/>.
     ///
     /// This interface is the one-way boundary: the StageBeam renderer depends on it, the data

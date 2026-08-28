@@ -22,7 +22,7 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-外部パッケージ(mvr-toolkit の `StageBeamSource` 等)は `IStageBeamSource` を実装して
+外部パッケージは `IStageBeamSource` を実装して
 `StageBeamDriver.AddSource()` を呼ぶだけで同じレンダラーに乗る。依存は常に一方向
 (上位 → stage-beam)。
 

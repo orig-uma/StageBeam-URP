@@ -4,7 +4,7 @@ using UnityEngine;
 namespace Origuma.StageBeam
 {
     /// <summary>
-    /// Standalone stress test for the stage-beam renderer. Bypasses the MVR/DMX rig
+    /// Standalone stress test for the stage-beam renderer. Bypasses the data-driven rig
     /// entirely: it builds a cone mesh + material and pushes a configurable number of
     /// animated beams straight into <see cref="StageBeamQueue"/> every frame, arranged
     /// so the cones blanket the screen for worst-case fill-rate measurement.

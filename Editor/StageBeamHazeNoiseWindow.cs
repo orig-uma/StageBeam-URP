@@ -365,8 +365,8 @@ namespace Origuma.StageBeam.Editor
                 // every reference to the old one — a Renderer Feature's Haze Noise slot, anything
                 // pointing at it from a scene. CopySerialized writes the new contents (including the
                 // resolution and format, so a size change is fine) into the object that is already
-                // there, so the .meta and its GUID survive. Same trick GdtfEditorImporter uses to
-                // re-import a fixture asset without orphaning scene references.
+                // there, so the .meta and its GUID survive — the asset can be re-imported
+                // without orphaning scene references.
                 EditorUtility.CopySerialized(tex, existing);
                 DestroyImmediate(tex);              // in-memory temp, never persisted
                 EditorUtility.SetDirty(existing);

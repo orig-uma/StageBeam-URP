@@ -22,7 +22,7 @@ namespace Origuma.StageBeam
     /// cannot be animated from Timeline at all — which is exactly why nothing a show might move
     /// during a cue should end up there.
     ///
-    /// EdgeSoftness is deliberately absent. For GDTF fixtures it is derived from the beam type plus
+    /// EdgeSoftness is deliberately absent. For rig-driven fixtures it is derived from the beam type plus
     /// the live Frost attribute, so it is not something anyone authors; a hand-placed light authors
     /// it directly. Including it would create a field that silently loses to derivation on one of
     /// the two paths, which is the very confusion this struct exists to end.

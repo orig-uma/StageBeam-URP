@@ -1,7 +1,7 @@
 # Stage Beam — 使い方 (Usage)
 
 Volumetric stage-light beams for URP. This guide gets a beam on screen in two steps, with no
-MVR/DMX/GDTF knowledge required.
+external-rig knowledge required.
 
 ## 1. Install
 
@@ -93,9 +93,9 @@ Feature set **Shadows**:
 - **Light Shadow Map** — **highest quality**: each beam samples the URP shadow map of a real
   spot light co-located with the fixture, giving geometry-exact silhouettes (limbs, fingers,
   cloth — no sphere/voxel approximation, no dither noise; the projected floor pool is masked
-  by the same shadow). Requirements: the fixture needs a real shadowed spot Light — the MVR
-  path gets this automatically from `StageBeamLightSync` (set its **Shadows** to Soft and keep
-  **Max Lights** modest); a standalone `StageBeamLight` uses its **Shadow Light** slot (or any
+  by the same shadow). Requirements: the fixture needs a real shadowed spot Light — a data-driven
+  rig integration can supply this automatically via a light-sync source (set its **Shadows** to Soft
+  and keep **Max Lights** modest); a standalone `StageBeamLight` uses its **Shadow Light** slot (or any
   child Light). URP asset: additional light shadows must be enabled. Beams without a visible
   shadowed light render unshadowed in this mode.
 - **Volume** — shared world-space occupancy volume, **built automatically — no scene setup**,
@@ -222,7 +222,7 @@ levers below attack those.
   (0 = off) additionally drops beams whose on-screen footprint is smaller than N pixels
   (distant/tiny beams whose contribution isn't visible). Both target the coverage side directly.
 - **Raymarch Steps** is the single biggest PER-BEAM cost lever — a linear multiplier on raymarch
-  work per covered pixel. The MVR source defaults to 10 and it's usually indistinguishable from
+  work per covered pixel. Rig-driven sources typically default to 10 and it's usually indistinguishable from
   24; lower still for background beams. Zoom-wide beams auto-reduce steps further (Adaptive
   Steps on the driver). Inside the march, the shadow and haze terms are both re-sampled only
   every other step (they vary slowly along the ray) — so their 3D-texture taps are already halved.
@@ -263,5 +263,5 @@ deliberately renderer-neutral so it can slot in without touching any beam source
 - **Drop-in** (`StageBeamLight`): the component covered by this guide. Zero external knowledge —
   every value is a plain Inspector field.
 - **Programmatic** (`IStageBeamSource`): implement the interface yourself to feed beams computed
-  from another system (e.g. an MVR/DMX rig) into a `StageBeamDriver`. See
+  from another system (e.g. a data-driven lighting rig) into a `StageBeamDriver`. See
   `Runtime/Driver/IStageBeamSource.cs` and `Runtime/Driver/StageBeamInstance.cs`.
