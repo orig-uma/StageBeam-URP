@@ -7,7 +7,7 @@ namespace Origuma.StageBeam
     /// the <c>Origuma/StageBeamCone</c> shader needs. Produced by an <see cref="IStageBeamSource"/>
     /// and consumed by <see cref="StageBeamDriver"/>.
     ///
-    /// This is the entire contract between a beam data source (e.g. an MVR/DMX rig) and the
+    /// This is the entire contract between a beam data source (e.g. a data-driven lighting rig) and the
     /// renderer. It contains only UnityEngine types, so the StageBeam package never needs to know
     /// what produced the beams.
     /// </summary>

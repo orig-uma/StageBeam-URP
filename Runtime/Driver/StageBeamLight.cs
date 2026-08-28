@@ -4,7 +4,7 @@ using UnityEngine;
 namespace Origuma.StageBeam
 {
     /// <summary>
-    /// Standalone, per-GameObject volumetric beam. Zero MVR/DMX knowledge required: add this
+    /// Standalone, per-GameObject volumetric beam. Zero external-rig knowledge required: add this
     /// component to any GameObject and it registers itself with a <see cref="StageBeamDriver"/>
     /// (auto-created if the scene doesn't have one yet) and renders one beam every frame.
     ///
@@ -162,7 +162,7 @@ namespace Origuma.StageBeam
             var beamHalfRad = beamAngleClamped * 0.5f * Mathf.Deg2Rad;
             var endRadius = Range * Mathf.Tan(fieldHalfRad) + StartRadius;
 
-            // Flux conservation: Ω(ref)/Ω(actual), clamped like the MVR path — wide cones
+            // Flux conservation: Ω(ref)/Ω(actual), clamped like the rig-driven path — wide cones
             // dim per unit volume instead of the fog simply growing brighter in total.
             float zoomFlux = 1f;
             if (ConserveFlux)
