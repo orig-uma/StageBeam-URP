@@ -72,16 +72,23 @@ namespace Origuma.StageBeam
         [Tooltip("Mesh-voxelization passes (X/Y/Z). 3 = fully conservative; 2 drops the top-down " +
                  "pass for a cheaper occlusion build (recorded draw count scales with this).")]
         [Range(1, 3)] public int VoxelizeAxisCount = 3;
+        [Tooltip("Voxelize skinned occluders by COMPUTE instead of rasterization: same geometry, " +
+                 "same shadow, zero draw calls. Needs GPU skinning; unavailable buffers fall back " +
+                 "to raster per renderer.")]
+        public bool ComputeSkinnedVoxelize = true;
         [Tooltip("Static/dynamic split (perf): voxelize non-moving occluders once (cached), " +
                  "re-voxelize only dynamic ones each build. Automatic classification. MeshVoxelize only.")]
         public bool StaticDynamicSplit;
-        [Tooltip("Legacy approximation (Mesh Voxelize off): emit one sphere per bone for " +
-                 "skinned meshes instead of a single box.")]
+        [Tooltip("With Mesh Voxelize off, shape skinned occluders as one sphere per bone instead " +
+                 "of a single box. Turn it on for limb-shaped character shadows, off for a cheaper " +
+                 "coarse blob. No effect while Mesh Voxelize is on.")]
         public bool ArticulateSkinnedMeshes = true;
         [Tooltip("Max spheres taken from a skinned mesh's skeleton, sampled evenly across its bones.")]
         [Range(1, 32)] public int BonesPerOccluder = 16;
-        [Tooltip("Bone sphere radius = skeleton span * this (bone positions, NOT renderer bounds " +
-                 "— inflated culling bounds don't fatten the shadow). ~0.08 reads as limbs.")]
+        // Measured across BONE POSITIONS, not renderer bounds, so inflated culling bounds cannot
+        // fatten the shadow.
+        [Tooltip("Thickness of the per-bone spheres, as a fraction of the skeleton's span. " +
+                 "About 0.08 reads as limbs; raise for a heavier body, lower for thin shadows.")]
         [Range(0.02f, 0.3f)] public float BoneRadiusScale = 0.12f;
         [Tooltip("Ignore occluders whose bounds are larger than this (floors, walls) so they don't " +
                  "swallow the whole volume. 0 = keep everything.")]
@@ -106,9 +113,10 @@ namespace Origuma.StageBeam
         [Range(1, 48)]  public int   ShadowSteps = 16;
         public float MaxShadowDistance = 25f;
         public float Bias = 0.05f;
-        [Tooltip("World-space radius around each beam's own apex where the shadow march is skipped. " +
-                 "The fixture housing sits right at the apex, so without this the volume self-shadows " +
-                 "the beam's own root if the fixture's renderer is (or overlaps) an occluder.")]
+        // The fixture housing sits right at the apex, so without this a fixture that is itself an
+        // occluder shadows the root of its own beam.
+        [Tooltip("Metres around a beam's own lens where shadows are ignored. Raise it if a beam's " +
+                 "root goes dark because its own fixture is casting into it.")]
         public float LightBias = 0.5f;
         [Range(0f, 1f)] public float EdgeSoftness = 0.5f;   // volume-splat soft shell
         [Tooltip("Temporal smoothing (0 = off, 1 = heavy): absorbs voxel chatter from moving " +
@@ -153,6 +161,7 @@ namespace Origuma.StageBeam
             b.OccluderMask           = OccluderMask;
             b.MeshVoxelize           = MeshVoxelize;
             b.VoxelizeAxisCount      = VoxelizeAxisCount;
+            b.ComputeSkinnedVoxelize = ComputeSkinnedVoxelize;
             b.StaticDynamicSplit     = StaticDynamicSplit;
             b.RescanInterval         = RescanInterval;
             b.ArticulateSkinnedMeshes = ArticulateSkinnedMeshes;

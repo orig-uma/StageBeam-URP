@@ -55,23 +55,38 @@ namespace Origuma.StageBeam
     {
         [SerializeField] private RenderPassEvent _event = RenderPassEvent.AfterRenderingTransparents;
 
-        [Tooltip("Render beams into a downscaled target and upsample — the biggest fill-rate lever " +
-                 "when beams cover the screen. Raymarch pixels: Half = 1/4, Third = 1/9, " +
-                 "Quarter = 1/16. Third sits between Half and Quarter: reach for it when Quarter " +
-                 "bands/moires at high output resolutions but Half costs too much. Beams soften " +
-                 "slightly (depth-aware upsample keeps object edges clean).")]
-        [SerializeField] private ResolutionScale _resolutionScale = ResolutionScale.Quarter;
+        [Tooltip("Beam buffer size as a fraction of the screen, per axis — the biggest fill-rate " +
+                 "lever when beams cover the screen. Cost scales with the SQUARE: 0.75 raymarches " +
+                 "56% of the pixels, 0.5 = 25%, 0.33 = 11%. 1 = sharpest gobo/prism shafts; " +
+                 "lower softens them and eventually moires. Try raising Raymarch Steps before " +
+                 "dropping below 0.5, and measure first — a beam-heavy scene is often limited " +
+                 "by something other than the beams.")]
+        [Range(0.25f, 1f)] [SerializeField] private float _resolutionFactor = 0.5f;
+
+        // Legacy preset dropdown, kept only to migrate old assets into _resolutionFactor (see
+        // Create()). The float slider replaced it because the useful setting turned out to sit
+        // BETWEEN the presets (0.7-0.8 for shaft detail at reasonable cost).
+        [SerializeField, HideInInspector] private ResolutionScale _resolutionScale = ResolutionScale.Half;
+        [SerializeField, HideInInspector] private bool _resolutionFactorMigrated = false;
 
         [Tooltip("Depth-aware smoothing of the beam buffer before compositing. Averages away " +
                  "the raymarch/shadow jitter grain — most visible in shadowed regions at Half/" +
                  "Quarter resolution — at the cost of a slightly softer fog. Near-free.")]
         [SerializeField] private bool _noiseSmoothing = true;
 
-        [Tooltip("Anti-banding dither applied when the beam is composited into the camera target, " +
-                 "as a fraction of each pixel's value. Beams are wide, smooth, low-slope ramps — " +
-                 "exactly what quantizes into Mach bands in the camera's low-mantissa HDR format " +
-                 "(B10G11R11, 32-bit HDR). Raise until the contours break up; lower if it reads as " +
-                 "grain. 0 = off (and free — the branch is skipped).")]
+        // Widens the cone rim to at least this many pixel footprints, the same trick the gobo
+        // prefilter uses: a transition thinner than the sampling grid aliases against it. Only ever
+        // widens, so beams already soft on screen keep their authored edge.
+        [Tooltip("Softens the beam edge to at least this many pixels, so narrow or distant beams " +
+                 "stop showing a staircase. Raise it if edges still look stepped at Third or " +
+                 "Quarter; 0 turns it off. Costs nothing on beams that are already soft.")]
+        [Range(0f, 4f)] [SerializeField] private float _edgeAntiAlias = 1.5f;
+
+        // Beams are wide, smooth, low-slope ramps — exactly what quantizes into Mach bands in the
+        // camera's low-mantissa HDR formats (B10G11R11, 32-bit HDR).
+        [Tooltip("Noise added when beams are composited, to break up the concentric bands a " +
+                 "smooth gradient shows in HDR. Raise until the contours disappear; lower if it " +
+                 "reads as grain. 0 = off, and costs nothing.")]
         [Range(0f, 0.5f)] [SerializeField] private float _dither = 0.15f;
 
         [Tooltip("On: the raymarch dither DRIFTS with the haze (screen-space, matched to the " +
@@ -90,10 +105,11 @@ namespace Origuma.StageBeam
                  "contribution isn't visible anyway.")]
         [Range(0f, 32f)] [SerializeField] private float _minScreenRadiusPx = 0f;
 
-        // Ordered coarsest-to-finest as it reads in the dropdown. NOTE: these serialize by index,
-        // so this ordering is not append-safe — any asset previously saved as Quarter (2) now loads
-        // as Third. Re-check the Resolution Scale on existing Renderer Feature assets.
-        public enum ResolutionScale { Full, Half, Third, Quarter }
+        // LEGACY — superseded by the _resolutionFactor slider; kept only so old assets can
+        // migrate their saved preset (these serialize by index, hence ThreeQuarter at the end:
+        // inserting it "in order" would have shifted every saved Half/Third/Quarter one step
+        // coarser).
+        public enum ResolutionScale { Full, Half, Third, Quarter, ThreeQuarter }
 
         // Back-compat: the old bool field is migrated to the enum on first load (see OnEnable).
         [SerializeField, HideInInspector] private bool _halfResolution = false;
@@ -102,8 +118,45 @@ namespace Origuma.StageBeam
         [Tooltip("ONE dial for \"beams vs scene\": multiplies every beam's volumetric brightness " +
                  "(and the projected pools) without touching per-fixture intensities. The low " +
                  "default keeps performers/characters readable inside beams; raise for a " +
-                 "heavier haze look.")]
-        [Range(0f, 2f)] [SerializeField] private float _masterIntensity = 0.05f;
+                 "heavier haze look. Raise it alongside the Physical Beam Model, which " +
+                 "redistributes brightness rather than adding it, so beams come out dimmer " +
+                 "from the usual viewing angles. Anisotropy no longer needs this — a beam seen " +
+                 "side-on holds its brightness at any setting.")]
+        // 0.1 -> 0.08 for new assets, following two changes that each moved the exposure of a
+        // default fixture (Anisotropy 0.6, Hotspot 1) seen side-on:
+        //   phase normalisation  x2.48 brighter (side-on was 0.404 of isotropic, now exactly 1)
+        //   Hotspot in the bell  x0.5  dimmer   ((1 + Hotspot) x bell became bell^Hotspot)
+        // Net x1.24, so 0.1 / 1.24 = 0.08 lands a default beam back where it already sat. Assets
+        // saved before this keep their 0.1 and come out 24% brighter — a nudge, not a re-tune.
+        [Range(0f, 2f)] [SerializeField] private float _masterIntensity = 0.08f;
+
+        // ONE dial for how physical the beam model is (was briefly three: photometric profile,
+        // physical falloff, edge diffusion). Every mixed combination read as an incoherent look —
+        // a candela bell dimming over a normalised ramp, say — so the split bought confusion, not
+        // control. Per-fixture character stays in each fixture's Look (AxialFalloff = falloff
+        // exponent, Hotspot/angles = bell shape). Model and derivations: StageBeamConeCore.hlsl.
+        [Tooltip("How physically the beams behave. 1 = the real thing: candela bell across the " +
+                 "beam (from each fixture's own beam/field angles), brightness decaying down " +
+                 "the throw from an unchanged source end (fixture Axial Falloff = steepness), " +
+                 "and an edge that diffuses over distance. 0 = legacy: flat-topped core, even " +
+                 "brightness ramping off near the far end, constant edge. Redistributes " +
+                 "rather than adds light — rebalance with Master Intensity.")]
+        [Range(0f, 1f)] [SerializeField] private float _physicalModel = 1f;
+
+        [Tooltip("Metres over which a beam eases back in just in front of the camera, so " +
+                 "flying the camera into a beam meets fog instead of a hard bright wall. 0 = off.")]
+        [Range(0f, 3f)] [SerializeField] private float _nearFade = 0.35f;
+
+        // Mixes each fixture's Anisotropy lobe toward isotropic. A single Henyey-Greenstein lobe
+        // describes ONE bounce; in haze thick enough to show beams, much of what reaches the eye
+        // has bounced repeatedly, and the limit of that is isotropic. A property of the room, not
+        // of a fixture, so it lives here rather than in the Look. Default 0 = single scattering,
+        // exactly as before this existed.
+        [Tooltip("How much of the haze glow has bounced more than once. 0 = none. 0.1-0.25 gives " +
+                 "thick haze the soft halo it carries around a beam and stops beams pointed away " +
+                 "from the camera going flat. Raise it together with fixture Density — thin haze " +
+                 "genuinely does not do this.")]
+        [Range(0f, 1f)] [SerializeField] private float _multiScatter = 0f;
 
         [Header("Haze Noise (optional)")]
         [Tooltip("Tileable 3D noise that modulates beam density to look like drifting atmosphere. " +
@@ -113,6 +166,23 @@ namespace Origuma.StageBeam
         private bool _hazeNoiseLoadTried;
         [Tooltip("Haze turbulence amount. 0 = off (uniform beam).")]
         [Range(0f, 1f)] [SerializeField] private float _hazeStrength = 0f;
+
+        // Both halves of Beer-Lambert: samples dim on the way to the eye, AND the accumulated
+        // optical depth dims the background through a second MRT target (StageBeamConeCore.hlsl).
+        // Above 0 the beams are forced through the offscreen composite, which is what owns the
+        // transmittance blend — so this is also the switch between two render routes.
+        //
+        // The ceiling is 1.0 rather than the 0.3 it launched with: at 0.3/m a beam has to be ~8 m
+        // deep before it occludes anything worth seeing, which put the whole interesting range in
+        // the top tenth of the slider. New assets default to 0.05 (visible front-to-back without
+        // reading as smoke); assets saved before this field existed keep their serialized 0 and so
+        // keep their exact look until someone raises it.
+        [Tooltip("How much the haze dims light passing through it, per metre. 0 = beams are pure " +
+                 "additive glow: no front-to-back, and nothing behind them is dimmed. 0.02-0.1 " +
+                 "gives a beam a visible near and far side and lets it darken the background it " +
+                 "crosses, which is what makes an edge read against a bright set. Higher is thick " +
+                 "smoke. Above 0 beams render through the offscreen buffer.")]
+        [Range(0f, 1f)] [SerializeField] private float _hazeExtinction = 0.05f;
         [Tooltip("World units → noise size. Smaller = larger, softer blobs.")]
         [SerializeField] private float _hazeScale = 0.3f;
         [Tooltip("Drift velocity of the haze in world units per second.")]
@@ -130,12 +200,11 @@ namespace Origuma.StageBeam
                  "character's layer so beams don't paint light onto performers. Everything = " +
                  "no filtering (and no extra cost).")]
         [SerializeField] private LayerMask _projectionReceiverLayers = ~0;
-        [Tooltip("Extra hardness on the FLOOR POOL's shadow only. 0 (default) = the pool's " +
-                 "shadow matches the volumetric beam's soft residual, so the two stay consistent " +
-                 "(the light reaching the floor equals the light left in the beam above it). " +
-                 "Raise it for a crisper floor shadow, but note it then reads DARKER than the " +
-                 "faint beam residual above — a stylistic choice, not physical. To deepen the " +
-                 "occlusion of BOTH the beam and the pool together, raise Volume ▸ Density instead.")]
+        // At 0 the pool's shadow matches the beam's soft residual, which is the consistent
+        // reading: the light reaching the floor is the light left in the beam above it.
+        [Tooltip("Extra shadow hardness on the floor pool only. Raise for a crisper shadow on the " +
+                 "ground, at the cost of it reading darker than the beam directly above it. To " +
+                 "deepen beam and pool together, raise Volume Density instead.")]
         [Range(0f, 0.9f)] [SerializeField] private float _projectionShadowHardness = 0.1f;
 
         [Header("Volumetric Shadows")]
@@ -159,6 +228,12 @@ namespace Origuma.StageBeam
                  "count scales with this) and usually enough for upright performers. Lower if the " +
                  "build's CPU cost matters more than catching perfectly horizontal surfaces.")]
         [Range(1, 3)] [SerializeField] private int _volVoxelizeAxes = 3;
+        // The raster path costs one draw plus a SetPass per renderer PER AXIS, so a cast of
+        // performers is hundreds of draw calls per build; compute reads the skinned buffers direct.
+        [Tooltip("Build skinned occluders with compute instead of drawing them. Same shadow, but " +
+                 "no draw calls — leave it on. Needs GPU skinning in Player Settings; anything it " +
+                 "cannot read falls back to the drawing path on its own.")]
+        [SerializeField] private bool _volComputeSkinned = true;
         [Tooltip("Static/dynamic occluder split (perf). Voxelizes non-moving rigid occluders once " +
                  "into a cached volume and re-voxelizes only dynamic ones (skinned performers + " +
                  "anything that moved) each build — killing the per-build draw spike from static " +
@@ -169,9 +244,11 @@ namespace Origuma.StageBeam
         [Tooltip("Occluder opacity per metre along the shadow ray (Beer-Lambert extinction). " +
                  "8 makes a ~0.5 m body block ~98%; lower for softer, gauzier shadows.")]
         [Range(1f, 16f)] [SerializeField] private float _volDensity = 8f;
-        [Tooltip("Samples along the part of the shadow ray that crosses the occlusion volume. " +
-                 "Raise only if thin occluders shimmer or band.")]
-        [Range(1, 48)] [SerializeField] private int _volSteps = 16;
+        [Tooltip("Cost cap on shadow-ray samples. The march paces itself from the voxel size " +
+                 "(about two voxels per step) so thin occluders always resolve; this only caps " +
+                 "how much that may spend on long spans. If shadows look blobby or noisy, " +
+                 "tighten the volume box or raise its Resolution — not this cap.")]
+        [Range(1, 48)] [SerializeField] private int _volSteps = 32;
         [SerializeField] private float _volMaxDistance = 25f;
         [Tooltip("Temporal smoothing of the shadow volume (0 = off/instant, 1 = heavy). Absorbs " +
                  "the frame-to-frame voxel chatter a MOVING occluder (a dancer) causes, so shadow " +
@@ -228,6 +305,15 @@ namespace Origuma.StageBeam
         private static readonly int IdProjReceiverMask  = Shader.PropertyToID("_ProjReceiverMaskOn");
         private static readonly int IdProjReceiverDepth = Shader.PropertyToID("_StageBeamReceiverDepth");
         private static readonly int IdMasterIntensity   = Shader.PropertyToID("_StageBeamMaster");
+        private static readonly int IdEdgeAntiAlias    = Shader.PropertyToID("_StageBeamEdgeAA");
+        private static readonly int IdPhysicalModel    = Shader.PropertyToID("_StageBeamPhysical");
+        private static readonly int IdNearFade         = Shader.PropertyToID("_StageBeamNearFade");
+        private static readonly int IdMultiScatter     = Shader.PropertyToID("_StageBeamMultiScatter");
+        private static readonly int IdGoboFilterWiden  = Shader.PropertyToID("_StageBeamGoboFilterWiden");
+        private static readonly int IdHazeExtinction   = Shader.PropertyToID("_StageBeamExtinction");
+        private static readonly int IdBeamTauTex       = Shader.PropertyToID("_BeamTauTex");
+        private static readonly int IdBeamTransmittance = Shader.PropertyToID("_BeamTransmittance");
+        private const string KeywordTransmittance = "_STAGEBEAM_TRANSMITTANCE";
 
         public override void Create()
         {
@@ -237,18 +323,30 @@ namespace Origuma.StageBeam
                 if (_halfResolution) _resolutionScale = ResolutionScale.Half;
                 _resolutionMigrated = true;
             }
+            // ...and the retired enum to the float slider, once (chained after the bool so a
+            // pre-enum asset flows bool → enum → float in a single load).
+            if (!_resolutionFactorMigrated)
+            {
+                _resolutionFactor = _resolutionScale switch
+                {
+                    ResolutionScale.ThreeQuarter => 0.75f,
+                    ResolutionScale.Half => 0.5f,
+                    ResolutionScale.Third => 1f / 3f,
+                    ResolutionScale.Quarter => 0.25f,
+                    _ => 1f,
+                };
+                _resolutionFactorMigrated = true;
+            }
             _pass = new StageBeamPass { renderPassEvent = _event };
             _upsampleMat   = CoreUtils.CreateEngineMaterial("Origuma/StageBeamUpsample");
             _projectionMat = CoreUtils.CreateEngineMaterial("Origuma/StageBeamProjection");
         }
 
-        private int ResolutionDivisor => _resolutionScale switch
-        {
-            ResolutionScale.Half => 2,
-            ResolutionScale.Third => 3,
-            ResolutionScale.Quarter => 4,
-            _ => 1,
-        };
+        private float ResolutionDivisor => 1f / Mathf.Clamp(_resolutionFactor, 0.25f, 1f);
+
+        // Needs the upsample material: the transmittance blend lives in that composite pass, and
+        // without it there is nothing to apply the accumulated depth with.
+        private bool TransmittanceOn => _hazeExtinction > 1e-5f && _upsampleMat != null;
 
         protected override void Dispose(bool disposing)
         {
@@ -356,11 +454,21 @@ namespace Origuma.StageBeam
             }
 
 #if UNITY_EDITOR
-            // The occupancy build runs an immediate Graphics.ExecuteCommandBuffer OUTSIDE the
-            // RenderGraph, which stops the Frame Debugger from freezing a frame (it re-submits GPU
-            // work on every repaint). While the editor is PAUSED — the Frame Debugger's normal use
-            // — skip the rebuild entirely: returning null keeps the last-bound volume + globals, so
-            // the shadow holds its last state and the debugger can capture a stable frame.
+            // THE reason the Frame Debugger never shows this build — and why Set Pass Calls
+            // drops in the Statistics panel the moment the debugger pauses the game: while the
+            // editor is paused, this returns null and the build is skipped ON PURPOSE.
+            //
+            // The GPU half executes through Graphics.ExecuteCommandBuffer outside the render
+            // graph, so during a pause it would be re-submitted on every editor repaint — work
+            // the Frame Debugger cannot attribute to any pass and which destabilises its
+            // capture. Skipping keeps the last-bound volume + globals live (the shadow holds its
+            // final state, so the paused image still looks right) and the capture stable, at the
+            // price of the build being invisible in it.
+            //
+            // Moving the build into the render graph is the real fix; two attempts failed and
+            // were reverted (see the note at the BuildAndBind call site). Until then,
+            // Window > Origuma > Stage Beam > Log Occlusion Build Cost — run while PLAYING —
+            // is the accounting for what this skipped work costs.
             if (UnityEditor.EditorApplication.isPaused) return null;
 #endif
 
@@ -373,7 +481,9 @@ namespace Origuma.StageBeam
             // `elapsed >= 0` guards against Time.frameCount RESETTING below the stored build
             // frame (it resets on Play enter while this feature instance — and its
             // _occlusionBuiltFrame — persist across sessions): a negative elapsed must NOT be
-            // read as "within the interval" or the volume would never rebuild.
+            // read as "within the interval" or the volume would never rebuild. The equality
+            // half also dedupes multiple cameras in the same frame — a visible Scene view
+            // renders the same frameCount and must not trigger a second build.
             if (Application.isPlaying)
             {
                 int elapsed = Time.frameCount - _occlusionBuiltFrame;
@@ -420,10 +530,11 @@ namespace Origuma.StageBeam
         // box, then lets these drive the shadow behaviour).
         private void ApplyFeatureOcclusionSettings(StageBeamOcclusionBuilder b)
         {
-            b.OccluderMask       = _occluderMask;
-            b.MeshVoxelize       = _volMeshVoxelize;
-            b.VoxelizeAxisCount  = _volVoxelizeAxes;
-            b.StaticDynamicSplit = _volStaticDynamicSplit;
+            b.OccluderMask           = _occluderMask;
+            b.MeshVoxelize           = _volMeshVoxelize;
+            b.VoxelizeAxisCount      = _volVoxelizeAxes;
+            b.ComputeSkinnedVoxelize = _volComputeSkinned;
+            b.StaticDynamicSplit     = _volStaticDynamicSplit;
             b.Strength           = _volStrength;
             b.ShadowDensity      = _volDensity;
             b.ShadowSteps        = _volSteps;
@@ -434,12 +545,31 @@ namespace Origuma.StageBeam
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
         {
             ApplyShadowMode();
-            // Build the occupancy volume here (RenderGraph RECORDING phase) via an immediate
-            // command buffer — the same point the working auto path always used. Doing it as a
-            // RenderGraph pass aliased the voxelize temp RT with the beam offscreen buffer and
-            // corrupted the image, so the build stays outside the graph's texture machinery.
+            // KNOWN LIMITATION: this executes via Graphics.ExecuteCommandBuffer, which bypasses the
+            // SRP render loop — so the Frame Debugger has nowhere to attribute the build's hundreds
+            // of SetPass calls, and anyone investigating a high SetPass count finds nothing that
+            // explains them. Its home is a RenderGraph pass; two attempts at moving it there failed
+            // (the first aliased the voxelize temp RT onto the beam buffer and corrupted the image,
+            // the second rendered correctly only while paused and washed out during play) and both
+            // were reverted rather than left half-working. Use
+            // Window > Origuma > Stage Beam > Log Occlusion Build Cost to read the cost meanwhile.
             PrepareOcclusion()?.BuildAndBind();
             Shader.SetGlobalFloat(IdMasterIntensity, _masterIntensity);
+            Shader.SetGlobalFloat(IdEdgeAntiAlias, _edgeAntiAlias);
+            Shader.SetGlobalFloat(IdPhysicalModel, _physicalModel);
+            Shader.SetGlobalFloat(IdNearFade, _nearFade);
+            Shader.SetGlobalFloat(IdMultiScatter, _multiScatter);
+            // Gobo prefilter widening: 1 at Full, ~1.08 / 1.25 / 1.5 / 1.75 at ThreeQuarter /
+            // Half / Third / Quarter.
+            // The march's mip footprint targets exactly the sampling rate; when the buffer is
+            // magnified back to screen, that borderline choice is what remains visible as gobo
+            // moire, so filter slightly below the rate the smaller the buffer gets.
+            Shader.SetGlobalFloat(IdGoboFilterWiden, 0.75f + 0.25f * ResolutionDivisor);
+            Shader.SetGlobalFloat(IdHazeExtinction, _hazeExtinction);
+            // Drives the beam passes' second (optical-depth) target, the offscreen routing and the
+            // composite's blend. The KEYWORD it implies is set per-pass in DrawBeams, not here —
+            // see the comment there.
+            bool transmittance = TransmittanceOn;
             Shader.SetGlobalFloat(IdTemporalJitter, _temporalJitter ? 1f : 0f);
 
             // Screen-space velocity (pixels/sec) the raymarch dither drifts at, matched to the
@@ -493,6 +623,7 @@ namespace Origuma.StageBeam
             }
 
             _pass.ResolutionDivisor   = _upsampleMat != null ? ResolutionDivisor : 1;
+            _pass.Transmittance       = transmittance;
             _pass.NoiseSmoothing      = _noiseSmoothing;
             _pass.Dither              = _dither;
             _pass.UpsampleMat         = _upsampleMat;
@@ -545,7 +676,8 @@ namespace Origuma.StageBeam
         private sealed class StageBeamPass : ScriptableRenderPass
         {
             public float     Dither = 0.02f;          // anti-banding at the composite write
-            public int       ResolutionDivisor = 1;   // 1 = full, 2 = half, 3 = third, 4 = quarter
+            public float     ResolutionDivisor = 1;   // 1 = full, 4/3 = three-quarter, 2 = half, …
+            public bool      Transmittance;           // beams write optical depth and dim the background
             public bool      NoiseSmoothing = true;
             public bool      AllowInstancing = true;   // false in LightShadowMap mode (see feature)
             public Material  UpsampleMat;
@@ -593,6 +725,8 @@ namespace Origuma.StageBeam
             private class BlitData
             {
                 public TextureHandle Source;
+                public TextureHandle Tau;    // optical depth; invalid when transmittance is off
+                public bool UseTau;
                 public Material Mat;
                 public int W, H;
                 public float SoftCeiling;
@@ -616,8 +750,11 @@ namespace Origuma.StageBeam
                 // Soft Additive needs the composite to see the SUMMED beam total (the ceiling
                 // curve can't be expressed per-beam), so it always routes through the offscreen
                 // buffer — at full resolution unless the resolution scale asked for less.
-                int divisor = ResolutionDivisor;
-                if (divisor > 1 || StageBeamQueue.SoftComposite)
+                // Transmittance joins Soft Additive in forcing the offscreen route: the beam passes
+                // write a second target for it, which needs an attachment the camera colour has no
+                // slot for, and the blend that consumes it is the composite's.
+                float divisor = ResolutionDivisor;
+                if (divisor > 1.001f || StageBeamQueue.SoftComposite || Transmittance)
                     RecordOffscreen(renderGraph, resources, camera, divisor);
                 else
                     RecordFullRes(renderGraph, resources, camera);
@@ -711,6 +848,11 @@ namespace Origuma.StageBeam
                         new Vector4(1f / d.W, 1f / d.H, d.W, d.H));
                     ctx.cmd.SetGlobalFloat(IdBeamSoftCeiling, d.SoftCeiling);
                     ctx.cmd.SetGlobalFloat(IdBeamDither, d.Dither);
+                    // Explicitly OFF, not just left unset: the beam composite ran earlier this
+                    // frame and the global is still 1: pools would then be multiplied into the
+                    // camera by the BEAM buffer's transmittance, which is not their occlusion.
+                    // A light pool is a surface reflection — it does not occlude anything.
+                    ctx.cmd.SetGlobalFloat(IdBeamTransmittance, 0f);
                     Blitter.BlitTexture(ctx.cmd, d.Source, new Vector4(1f, 1f, 0f, 0f), d.Mat, 0);
                 });
             }
@@ -774,6 +916,14 @@ namespace Origuma.StageBeam
             private void DrawBeams(RasterGraphContext ctx, int w, int h)
             {
                 ctx.cmd.SetGlobalVector(IdBeamRTParams, new Vector4(1f / w, 1f / h, w, h));
+                // Recorded into the command buffer, NOT set with Shader.EnableKeyword during setup.
+                // The keyword decides whether the fragment declares SV_Target1, so it has to agree
+                // with the attachments THIS pass bound. Two renderer features with different
+                // extinction settings each run their own AddRenderPasses before either executes, so
+                // a globally-set keyword would carry the last one's answer into the other one's
+                // draw — a shader writing a target that pass never bound.
+                if (Transmittance) ctx.cmd.EnableShaderKeyword(KeywordTransmittance);
+                else               ctx.cmd.DisableShaderKeyword(KeywordTransmittance);
 
                 if (StageBeamQueue.Instancing && AllowInstancing)
                 {
@@ -872,11 +1022,11 @@ namespace Origuma.StageBeam
             // Offscreen accumulation + composite: divisor 2 = the half-res path, divisor 1 =
             // full-res (used by Soft Additive, whose ceiling curve needs the summed total).
             private void RecordOffscreen(RenderGraph renderGraph, UniversalResourceData resources,
-                                         UniversalCameraData camera, int divisor)
+                                         UniversalCameraData camera, float divisor)
             {
                 var desc = camera.cameraTargetDescriptor;
-                var offW = Mathf.Max(1, desc.width  / divisor);
-                var offH = Mathf.Max(1, desc.height / divisor);
+                var offW = Mathf.Max(1, Mathf.RoundToInt(desc.width  / divisor));
+                var offH = Mathf.Max(1, Mathf.RoundToInt(desc.height / divisor));
 
                 var offDesc = desc;
                 offDesc.width           = offW;
@@ -891,12 +1041,27 @@ namespace Origuma.StageBeam
                 var offRes = UniversalRenderer.CreateRenderGraphTexture(
                     renderGraph, offDesc, "StageBeamOffscreen", true, FilterMode.Bilinear);
 
+                // Second target: the optical depth every beam puts in front of the pixel, summed
+                // by the same One One blend as the colour (depths add where transmittances would
+                // have had to multiply — see StageBeamConeCore.hlsl). RHalf, not R8: the march
+                // runs to τ ≈ 6, and quantising that to 256 steps banded the background darkening
+                // in exactly the wide smooth gradients this whole pass fights to keep clean.
+                TextureHandle tauRes = default;
+                if (Transmittance)
+                {
+                    var tauDesc = offDesc;
+                    tauDesc.colorFormat = RenderTextureFormat.RHalf;
+                    tauRes = UniversalRenderer.CreateRenderGraphTexture(
+                        renderGraph, tauDesc, "StageBeamOpticalDepth", true, FilterMode.Bilinear);
+                }
+
                 // Pass 1 — raymarch the beams into the offscreen target.
                 {
                     using var builder = renderGraph.AddRasterRenderPass<ConeData>(
                         "Stage Beams (offscreen)", out var data);
                     data.W = offW; data.H = offH;
                     builder.SetRenderAttachment(offRes, 0);
+                    if (Transmittance) builder.SetRenderAttachment(tauRes, 1);
                     builder.UseAllGlobalTextures(true);
                     if (resources.cameraDepthTexture.IsValid())
                         builder.UseTexture(resources.cameraDepthTexture);
@@ -940,11 +1105,17 @@ namespace Origuma.StageBeam
                     using var builder = renderGraph.AddRasterRenderPass<BlitData>(
                         "Stage Beams (composite)", out var data);
                     data.Source = compositeSource;
+                    data.Tau    = tauRes;
+                    data.UseTau = Transmittance;
                     data.Mat    = UpsampleMat;
                     data.W = offW; data.H = offH;
                     data.SoftCeiling = StageBeamQueue.SoftComposite ? StageBeamQueue.SoftCeiling : 0f;
                     data.Dither = Dither;
                     builder.UseTexture(compositeSource);
+                    // The RAW depth target, not a denoised copy: τ carries no shadow term and no
+                    // gobo, so it has none of the stochastic grain the denoise pass exists for,
+                    // and the composite's own 3×3 bilateral tap is smoothing enough for it.
+                    if (Transmittance) builder.UseTexture(tauRes);
                     builder.UseAllGlobalTextures(true);
                     if (resources.cameraDepthTexture.IsValid())
                         builder.UseTexture(resources.cameraDepthTexture);
@@ -957,6 +1128,8 @@ namespace Origuma.StageBeam
                             new Vector4(1f / d.W, 1f / d.H, d.W, d.H));
                         ctx.cmd.SetGlobalFloat(IdBeamSoftCeiling, d.SoftCeiling);
                         ctx.cmd.SetGlobalFloat(IdBeamDither, d.Dither);
+                        ctx.cmd.SetGlobalFloat(IdBeamTransmittance, d.UseTau ? 1f : 0f);
+                        if (d.UseTau) ctx.cmd.SetGlobalTexture(IdBeamTauTex, d.Tau);
                         Blitter.BlitTexture(ctx.cmd, d.Source, new Vector4(1f, 1f, 0f, 0f), d.Mat, 0);
                     });
                 }

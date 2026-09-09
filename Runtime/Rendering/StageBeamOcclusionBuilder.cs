@@ -6,10 +6,14 @@ namespace Origuma.StageBeam
 {
     /// <summary>
     /// Builds the single shared world-space occupancy volume every StageBeam cone self-shadows
-    /// against: occluders are discovered by layer mask, approximated as oriented boxes from
-    /// their renderer's local bounds (per-bone spheres for skinned meshes, so dancers read as
-    /// limbs), voxelized by a compute shader once per frame, and bound as global shader state.
-    /// Cost is independent of how many beams are drawn.
+    /// against: occluders are discovered by layer mask, written into the volume once per frame,
+    /// and bound as global shader state. Cost is independent of how many beams are drawn.
+    ///
+    /// Two ways in, chosen by <see cref="MeshVoxelize"/>: rasterizing the occluders' real meshes
+    /// (the default — exact silhouettes, but a draw call per renderer per axis), or splatting
+    /// approximating shapes with a compute pass (oriented boxes from renderer bounds, per-bone
+    /// spheres for skinned meshes, or an authored <see cref="StageBeamOccluderHint"/> — no draw
+    /// calls at all). Hints apply in both modes.
     ///
     /// Boxes come from <see cref="Renderer.localBounds"/> + the transform — no per-object setup
     /// needed — so walls, risers, panels and cases occlude with their actual silhouette. When a
@@ -35,9 +39,25 @@ namespace Origuma.StageBeam
         /// <summary>Voxelize the occluders' REAL meshes (3-axis rasterization into the volume)
         /// instead of approximating them with spheres/boxes. Silhouettes become the actual
         /// render geometry — skinned poses and cloth deformation included — while the shared
-        /// volume keeps the cost independent of the light count. Off = legacy shape splatting
-        /// (bone spheres / bounds boxes / hint shapes).</summary>
+        /// volume keeps the cost independent of the light count. Off = shape splatting
+        /// (bone spheres / bounds boxes).
+        ///
+        /// A <see cref="StageBeamOccluderHint"/> still wins in EITHER mode: a hinted subtree is
+        /// splatted as its authored shape and taken out of the raster set. That is what makes the
+        /// hint a cost lever (a character's renderers stop costing a draw call each) as well as
+        /// what makes its Ignore option mean Ignore here.</summary>
         public bool MeshVoxelize = true;
+
+        /// <summary>
+        /// Voxelize SkinnedMeshRenderers by compute instead of rasterization. Same geometry,
+        /// same volume, ZERO draw calls: the skinned (deformed) vertices already live on the GPU
+        /// when GPU skinning is on, so a dispatch per renderer reads them directly — where the
+        /// raster path pays one DrawRenderer (with its own SetPass) per renderer PER AXIS. A cast
+        /// of performers goes from hundreds of draws per build to none.
+        /// Falls back to rasterization per renderer whenever the skinned vertex buffer is
+        /// unavailable (GPU skinning disabled, or the first frame after raw access is enabled).
+        /// </summary>
+        public bool ComputeSkinnedVoxelize = true;
 
         public bool ArticulateSkinnedMeshes = true;
         public int BonesPerOccluder = 16;
@@ -95,6 +115,97 @@ namespace Origuma.StageBeam
         public int OccluderCount => _occluders.Count;
         public Vector3 BoxCenter => _wc;
         public Vector3 BoxSize => _ws;
+
+        /// <summary>
+        /// Draw calls recorded by the LAST GPU build — the mesh-voxelize cost, which is what
+        /// actually scales with the scene.
+        ///
+        /// Exists because the build runs through Graphics.ExecuteCommandBuffer, OUTSIDE the render
+        /// graph, so the Frame Debugger cannot see any of it. Without a counter there is no way to
+        /// tell whether a change made this cheaper or more expensive. Counted while RECORDING, so
+        /// it costs an increment per call and nothing else.
+        /// </summary>
+        public int LastVoxelizeDrawCalls => _statDraws;
+        /// <summary>Occluders that actually rasterized last build (active and within MaxOccluderSize).</summary>
+        public int LastVoxelizedOccluders => _statOccluders;
+        /// <summary>Of those, how many were treated as dynamic (skinned, or moved since last build).</summary>
+        public int LastDynamicOccluders => _statDynamic;
+        /// <summary>True when the cached static volume was re-voxelized last build (the expensive case).</summary>
+        public bool LastRebuiltStatic => _statRebuiltStatic;
+        /// <summary>Distinct StageBeamOccluderHint components found above the collected occluders.
+        /// Zero means no hint is in play — so no subtree is being represented by a cheap shape.</summary>
+        public int HintCount => _statHints;
+        /// <summary>Occluders taken out of the raster set because a hint represents them.</summary>
+        public int HintCoveredOccluders => _statHintCovered;
+
+        /// <summary>
+        /// True when the movement history was EMPTY at the last build — expected exactly once,
+        /// on this builder's first build. History is keyed by renderer identity and survives
+        /// rescans, so TRUE recurring across samples means the builder itself is being recreated.
+        /// </summary>
+        public bool LastMatrixCacheReset => _statMatrixReset;
+        /// <summary>Time.frameCount of the last recorded build (staleness check for the report).</summary>
+        public int LastBuildFrame => _statBuildFrame;
+
+        /// <summary>
+        /// Of the dynamic occluders, how many are NON-skinned meshes that changed their matrix
+        /// since the previous build — and how big the largest change was. This separates the two
+        /// situations "everything is dynamic" collapses together: matrices moving by visible
+        /// amounts (fixtures actually panning — the cost is real; the lever is instancing) versus
+        /// micro-jitter far below a voxel (easing/animation rewriting near-identical values every
+        /// frame — an epsilon in the comparison would return those to the static cache with no
+        /// visible change, since a voxel is centimetres).
+        /// </summary>
+        public int LastMovedMeshCount => _statMovedMeshes;
+        /// <summary>Largest matrix-element change among those movers (world units).</summary>
+        public float LastMaxMovedDelta => _statMaxMovedDelta;
+        /// <summary>The renderer with that largest change (name resolved by the report, not here —
+        /// Renderer.name allocates).</summary>
+        public Renderer LastMaxMovedRenderer => _statMaxMovedRenderer;
+
+        /// <summary>Dynamic occluders that are skinned — MEASURED in the loop, not derived by
+        /// subtraction (a derived "skinned" figure once mislabelled 400 fixture meshes).</summary>
+        public int LastDynamicSkinned => _statDynSkinned;
+        /// <summary>Classification runs since this builder was created.</summary>
+        public int TotalBuilds => _statBuilds;
+        /// <summary>Renderers currently tracked by the identity-keyed movement history.</summary>
+        public int MovementHistoryCount => _moveHistory.Count;
+        /// <summary>Skinned renderers voxelized by the compute path last build — each of these
+        /// would otherwise have cost one draw call (its own SetPass) per axis.</summary>
+        public int LastComputeSkinned => _statComputeSkinned;
+        /// <summary>Compute dispatches and triangles the skinned voxelizer issued last build.
+        /// Time divided by dispatches tells you whether the pass is overhead-bound (a roughly
+        /// fixed microsecond cost per call, unmoved by triangle count) or work-bound.</summary>
+        public int LastSkinnedDispatches => _statSkinnedDispatches;
+        public int LastSkinnedTriangles => _statSkinnedTris;
+
+        /// <summary>Per-pass GPU timing (opt-in via StageBeamOcclusionProfiler.Enabled). With the
+        /// draw calls gone, time is the only way to tell which of the full-volume compute passes
+        /// actually costs anything.</summary>
+        public StageBeamOcclusionProfiler Profiler => _profiler;
+        private readonly StageBeamOcclusionProfiler _profiler = new StageBeamOcclusionProfiler();
+
+        private int _statDraws, _statOccluders, _statDynamic, _statDynSkinned;
+        private int _statHints, _statHintCovered;
+        private int _statBuildFrame = -1;
+        private int _statMovedMeshes;
+        private int _statBuilds;
+        private float _statMaxMovedDelta;
+        private Renderer _statMaxMovedRenderer;
+        private bool _statMatrixReset;
+        private bool _statRebuiltStatic;
+        private bool _warnedSphereOverflow;
+
+        private static float MaxAbsElementDelta(in Matrix4x4 a, in Matrix4x4 b)
+        {
+            float max = 0f;
+            for (int e = 0; e < 16; e++)
+            {
+                float d = Mathf.Abs(a[e] - b[e]);
+                if (d > max) max = d;
+            }
+            return max;
+        }
         public Vector4 GetSphere(int i) => _spheres != null && i < _spheres.Length ? _spheres[i] : default;
         public void GetBox(int i, out Vector3 center, out Vector3 halfExtents, out Quaternion rotation)
         {
@@ -112,6 +223,10 @@ namespace Origuma.StageBeam
         private Material _voxelizeMat;
         private int[] _occluderSubMeshes;   // parallel to _occluders, cached at rescan
         private readonly List<Renderer> _occluders = new List<Renderer>(128);
+
+        /// <summary>The collected occluder list, for editor diagnostics (the cost report's dump).
+        /// Read-only view; do not mutate through casts.</summary>
+        public IReadOnlyList<Renderer> OccludersForDebug => _occluders;
         // Per-occluder explicit shape override (StageBeamOccluderHint on a parent), resolved at
         // rescan time — parallel to _occluders. One hint covers many renderers; the emit pass
         // dedupes so a hinted character casts exactly one capsule/box.
@@ -130,13 +245,37 @@ namespace Origuma.StageBeam
         private bool _hasFit;
         private int _clearKernel = -1, _splatKernel = -1, _growKernel = -1, _dilateKernel = -1, _temporalKernel = -1;
         private int _combineKernel = -1;
+        private int _triKernel = -1;            // VoxelizeTriangles (compute path for skinned)
+
+        // GraphicsBuffer wrappers from GetVertexBuffer/GetIndexBuffer. Each call returns a NEW
+        // wrapper that must be disposed — but not while the command buffer that references it
+        // may still be executing on the GPU. Wrappers therefore retire on a two-build delay:
+        // used this build → survive the next → disposed at the start of the one after.
+        private List<GraphicsBuffer> _buffersThisBuild = new List<GraphicsBuffer>();
+        private List<GraphicsBuffer> _buffersInFlight  = new List<GraphicsBuffer>();
+        // Occluders handled by the compute path this build (parallel to _occluders); the raster
+        // axes skip these.
+        private bool[] _computeHandled;
+        private int _statComputeSkinned, _statSkinnedDispatches, _statSkinnedTris;
+        private bool _warnedNoSkinBuffer;
         private RenderTexture _volumeTemp;      // ping-pong for the dilate passes
         private RenderTexture _volumeHistory;   // temporal EMA of the occupancy (bound for shadowing)
         private RenderTexture _volumeStatic;    // cached static occupancy (StaticDynamicSplit)
-        // Static/dynamic classification state (parallel to _occluders).
-        private bool[] _dynamicFlags;           // this build: skinned OR transform moved
-        private bool[] _wasDynamic;             // last build's classification (flip → static set changed)
-        private Matrix4x4[] _lastMatrices;      // last build's transform (movement detection)
+        // Static/dynamic classification state.
+        private bool[] _dynamicFlags;           // this build, parallel to _occluders: skinned OR moved
+
+        // Movement history, keyed by RENDERER IDENTITY — deliberately not by list index. The
+        // occluder list is rebuilt by every rescan and FindObjectsByType's order is not stable,
+        // so index-keyed history compared renderer A against renderer B's old matrix after each
+        // rescan; the old code "solved" that by wiping the whole cache instead (Rescan used to
+        // null it), which reclassified every occluder as moved and re-voxelized the entire static
+        // set — the exact cost the static/dynamic split exists to avoid.
+        private struct MoveEntry { public Matrix4x4 Matrix; public bool WasDynamic; }
+        private readonly Dictionary<Renderer, MoveEntry> _moveHistory =
+            new Dictionary<Renderer, MoveEntry>(512);
+        private readonly HashSet<Renderer> _rescanSeen = new HashSet<Renderer>();
+        private readonly List<Renderer> _rescanDead = new List<Renderer>();
+        private bool _occluderSetShrunk;        // a tracked occluder vanished → static voxels linger
         private bool _staticDirty;              // static set changed → rebuild the static volume
         private bool _staticVolumeValid;
         private bool _historyValid;             // false right after (re)allocation → skip the blend once
@@ -167,6 +306,16 @@ namespace Origuma.StageBeam
         private static readonly int IdCVolSize  = Shader.PropertyToID("_VolSize");
         private static readonly int IdCRes      = Shader.PropertyToID("_Res");
         private static readonly int IdCSoft     = Shader.PropertyToID("_EdgeSoftness");
+        // triangle-voxelize kernel
+        private static readonly int IdTriVerts        = Shader.PropertyToID("_TriVerts");
+        private static readonly int IdTriIndices      = Shader.PropertyToID("_TriIndices");
+        private static readonly int IdTriIndexStart   = Shader.PropertyToID("_TriIndexStart");
+        private static readonly int IdTriIndexCount   = Shader.PropertyToID("_TriIndexCount");
+        private static readonly int IdTriBaseVertex   = Shader.PropertyToID("_TriBaseVertex");
+        private static readonly int IdTriIndex16      = Shader.PropertyToID("_TriIndex16");
+        private static readonly int IdTriVertStride   = Shader.PropertyToID("_TriVertStride");
+        private static readonly int IdTriPosOffset    = Shader.PropertyToID("_TriPosOffset");
+        private static readonly int IdTriLocalToWorld = Shader.PropertyToID("_TriLocalToWorld");
 
         /// <summary>The most recently built builder (auto or override) — lets
         /// <see cref="StageBeamOcclusionDebugView"/> visualize the shapes regardless of which
@@ -212,6 +361,16 @@ namespace Origuma.StageBeam
         public void RecordGpuBuild(CommandBuffer cmd)
         {
             if (_volume == null || _spheres == null) return;
+            _statDraws = 0;
+            _statRebuiltStatic = false;
+            _statBuildFrame = Time.frameCount;
+
+            // Retire the buffer wrappers from two builds ago (safely past GPU execution) and
+            // rotate last build's into the in-flight slot.
+            for (int i = 0; i < _buffersInFlight.Count; i++) _buffersInFlight[i]?.Dispose();
+            _buffersInFlight.Clear();
+            (_buffersInFlight, _buffersThisBuild) = (_buffersThisBuild, _buffersInFlight);
+            _profiler.Collect();   // read back what finished on the GPU since the last build
             RecordUploadAndDispatch(cmd);
             if (MeshVoxelize)
             {
@@ -242,6 +401,10 @@ namespace Origuma.StageBeam
             if (_volumeTemp != null) { _volumeTemp.Release(); CoreUtils.Destroy(_volumeTemp); _volumeTemp = null; }
             if (_volumeHistory != null) { _volumeHistory.Release(); CoreUtils.Destroy(_volumeHistory); _volumeHistory = null; }
             if (_volumeStatic != null) { _volumeStatic.Release(); CoreUtils.Destroy(_volumeStatic); _volumeStatic = null; }
+            for (int i = 0; i < _buffersInFlight.Count; i++) _buffersInFlight[i]?.Dispose();
+            _buffersInFlight.Clear();
+            for (int i = 0; i < _buffersThisBuild.Count; i++) _buffersThisBuild[i]?.Dispose();
+            _buffersThisBuild.Clear();
             _staticVolumeValid = false;
             _historyValid = false;
             _sphereBuffer?.Dispose(); _sphereBuffer = null;
@@ -268,6 +431,7 @@ namespace Origuma.StageBeam
                 _dilateKernel = Occlusion.HasKernel("Dilate") ? Occlusion.FindKernel("Dilate") : -1;
                 _temporalKernel = Occlusion.HasKernel("TemporalBlend") ? Occlusion.FindKernel("TemporalBlend") : -1;
                 _combineKernel = Occlusion.HasKernel("CombineMax") ? Occlusion.FindKernel("CombineMax") : -1;
+                _triKernel = Occlusion.HasKernel("VoxelizeTriangles") ? Occlusion.FindKernel("VoxelizeTriangles") : -1;
             }
             return _clearKernel >= 0;
         }
@@ -311,9 +475,31 @@ namespace Origuma.StageBeam
                 _occluderSubMeshes[i] = Mathf.Max(1, _tempMaterials.Count);
             }
 
-            // The occluder set (and thus per-index classification) changed → force a static rebuild.
-            _staticVolumeValid = false;
-            _lastMatrices = null;
+            // Prune history for renderers that left the scene. A REMOVED occluder must also force
+            // a static rebuild — its voxels linger in the cached static volume otherwise. That is
+            // the only rescan outcome that needs one: unchanged membership keeps every cache warm
+            // (movement history is keyed by renderer, so the list being rebuilt in a different
+            // order no longer matters), and ADDED occluders force the rebuild by themselves when
+            // they classify dynamic on first sight and flip static a build later.
+            _rescanSeen.Clear();
+            for (var i = 0; i < _occluders.Count; i++) _rescanSeen.Add(_occluders[i]);
+            _rescanDead.Clear();
+            foreach (var kv in _moveHistory)
+                if (!_rescanSeen.Contains(kv.Key)) _rescanDead.Add(kv.Key);
+            for (var i = 0; i < _rescanDead.Count; i++) _moveHistory.Remove(_rescanDead[i]);
+            if (_rescanDead.Count > 0) _occluderSetShrunk = true;
+        }
+
+        // Occluders represented by a StageBeamOccluderHint this build, so the mesh voxelizer skips
+        // them. Reset every gather because a hint can be added, removed or disabled at any time.
+        private bool[] _hintCovered;
+
+        private void MarkHintCovered(int index)
+        {
+            if (_hintCovered == null || _hintCovered.Length < _occluders.Count)
+                _hintCovered = new bool[Mathf.Max(_occluders.Count, 8)];
+            if (!_hintCovered[index]) _statHintCovered++;
+            _hintCovered[index] = true;
         }
 
         private void GatherOccluders()
@@ -322,6 +508,11 @@ namespace Origuma.StageBeam
             _boxCount = 0;
             _hasFit = false;
             _emittedHints.Clear();
+            if (_hintCovered != null) System.Array.Clear(_hintCovered, 0, _hintCovered.Length);
+            _statHintCovered = 0;
+            _statHints = 0;
+            for (var h = 0; h < _occluderHints.Count; h++)
+                if (_occluderHints[h] != null) _statHints++;
 
             for (var i = 0; i < _occluders.Count; i++)
             {
@@ -330,12 +521,28 @@ namespace Origuma.StageBeam
                 // contribute nothing to the volume until their GameObject is enabled.
                 if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
 
+                var hint = i < _occluderHints.Count ? _occluderHints[i] : null;
+
                 // Mesh voxelization: real geometry goes straight into the volume (see
                 // VoxelizeMeshes), so no approximation shapes are emitted here — this pass
                 // only accumulates the AutoFit bounds. Skinned fit still comes from bone
                 // positions so inflated culling bounds don't balloon the box.
                 if (MeshVoxelize)
                 {
+                    // A hint still WINS in mesh mode. Rasterizing a hinted subtree would both
+                    // duplicate the shape it already declares and pay a draw call per renderer —
+                    // the expensive half of a character (body, hair, clothes, cloth proxies) for a
+                    // silhouette the voxel grid quantises away anyway. So the shape is splatted by
+                    // the compute pass (no draw calls) and the renderers are taken out of the
+                    // raster set. This is also what makes Ignore mean Ignore here: without it a
+                    // subtree marked "casts no volumetric shadow" still voxelized.
+                    if (hint != null)
+                    {
+                        MarkHintCovered(i);
+                        if (_emittedHints.Add(hint)) EmitHint(hint);
+                        continue;
+                    }
+
                     if (r is SkinnedMeshRenderer skinned &&
                         TryComputeSkeletonBounds(skinned, out var skelFit))
                     {
@@ -353,7 +560,6 @@ namespace Origuma.StageBeam
 
                 // Explicit hint: the whole subtree occludes as ONE authored shape — stable and
                 // visible in the Scene view, immune to cloth-sim bones / inflated bounds.
-                var hint = i < _occluderHints.Count ? _occluderHints[i] : null;
                 if (hint != null)
                 {
                     if (_emittedHints.Add(hint)) EmitHint(hint);
@@ -393,7 +599,9 @@ namespace Origuma.StageBeam
             }
         }
 
-        private static readonly StageBeamOccluderHint.Segment[] HintSegments =
+        // Grown to whatever the hint needs: one hint can represent a whole cast, and a fixed
+        // 24-segment buffer would quietly keep only the first character's capsules.
+        private static StageBeamOccluderHint.Segment[] HintSegments =
             new StageBeamOccluderHint.Segment[StageBeamOccluderHint.MaxSegments];
 
         // One authored shape for a whole hinted subtree. Contributes to AutoFit like any other
@@ -411,6 +619,9 @@ namespace Origuma.StageBeam
 
             if (hint.Shape == StageBeamOccluderHint.OccluderShape.HumanoidCapsules)
             {
+                int need = hint.HumanoidSegmentCapacity;
+                if (HintSegments.Length < need)
+                    HintSegments = new StageBeamOccluderHint.Segment[need];
                 int n = hint.FillHumanoidSegments(HintSegments);
                 if (n > 0)
                 {
@@ -535,7 +746,20 @@ namespace Origuma.StageBeam
 
         private void EmitSphere(Vector3 center, float radius)
         {
-            if (_sphereCount >= _spheres.Length) return;
+            if (_sphereCount >= _spheres.Length)
+            {
+                // Silent truncation reads as "that character casts no shadow" with nothing to go
+                // on. An articulated humanoid costs ~17 spheres, so a cast of eight overruns the
+                // default 128 — say so once instead of letting shadows quietly disappear.
+                if (!_warnedSphereOverflow)
+                {
+                    _warnedSphereOverflow = true;
+                    Debug.LogWarning($"[StageBeam] Occluder shape budget full ({_spheres.Length}) — " +
+                        "further shapes are dropped and will cast no volumetric shadow. Raise " +
+                        "Max Occluders (an articulated humanoid costs ~17 shapes).");
+                }
+                return;
+            }
             _spheres[_sphereCount++] = new Vector4(center.x, center.y, center.z,
                                                    Mathf.Max(radius, 1e-3f));
         }
@@ -648,6 +872,39 @@ namespace Origuma.StageBeam
 
         private void RecordUploadAndDispatch(CommandBuffer cmd)
         {
+            var res = Resolution;
+            int gx = Mathf.CeilToInt(res.x / 4f);
+            int gy = Mathf.CeilToInt(res.y / 4f);
+            int gz = Mathf.CeilToInt(res.z / 4f);
+
+            // The volume's world placement, bound UNCONDITIONALLY. It describes the grid itself,
+            // not the shape splat, and the triangle voxelizer reads it to map world positions into
+            // voxels. It used to live inside the Splat block, which was harmless only because
+            // Splat always ran; once Splat became conditional (skipped when there are no shapes —
+            // the normal case) the values went stale, the voxelizer kept writing against an older
+            // box, and every shadow sat at a fixed offset from its caster.
+            cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
+            cmd.SetComputeVectorParam(Occlusion, IdCVolMin, _wc - _ws * 0.5f);
+            cmd.SetComputeVectorParam(Occlusion, IdCVolSize, _ws);
+
+            // Splat computes each voxel's coverage from scratch and writes it unconditionally, so
+            // it IS the clear when it runs — a preceding Clear only pays a second full-volume pass
+            // to write zeroes that Splat immediately overwrites. And with no shapes at all (the
+            // normal case once mesh voxelization handles everything) Splat itself is 663k threads
+            // whose entire job is to store 0, which Clear already does more cheaply. So: exactly
+            // one of the two runs, never both.
+            bool hasShapes = _sphereCount > 0 || _boxCount > 0;
+
+            if (!hasShapes)
+            {
+                using (_profiler.Sample(cmd, "Clear"))
+                {
+                    cmd.SetComputeTextureParam(Occlusion, _clearKernel, IdCOcc, _volume);
+                    cmd.DispatchCompute(Occlusion, _clearKernel, gx, gy, gz);
+                }
+                return;
+            }
+
             if (_sphereBuffer == null || _sphereBuffer.count != _spheres.Length)
             {
                 _sphereBuffer?.Dispose();
@@ -662,33 +919,23 @@ namespace Origuma.StageBeam
             }
             cmd.SetBufferData(_boxBuffer, _boxes);
 
-            var res = Resolution;
-            int gx = Mathf.CeilToInt(res.x / 4f);
-            int gy = Mathf.CeilToInt(res.y / 4f);
-            int gz = Mathf.CeilToInt(res.z / 4f);
-
-            // Clear
-            cmd.SetComputeTextureParam(Occlusion, _clearKernel, IdCOcc, _volume);
-            cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
-            cmd.DispatchCompute(Occlusion, _clearKernel, gx, gy, gz);
-
-            // Splat
-            var min = _wc - _ws * 0.5f;
-            cmd.SetComputeTextureParam(Occlusion, _splatKernel, IdCOcc, _volume);
-            cmd.SetComputeBufferParam(Occlusion, _splatKernel, IdCSpheres, _sphereBuffer);
-            cmd.SetComputeIntParam(Occlusion, IdCCount, _sphereCount);
-            cmd.SetComputeBufferParam(Occlusion, _splatKernel, IdCBoxes, _boxBuffer);
-            cmd.SetComputeIntParam(Occlusion, IdCBoxCount, _boxCount);
-            cmd.SetComputeVectorParam(Occlusion, IdCVolMin, min);
-            cmd.SetComputeVectorParam(Occlusion, IdCVolSize, _ws);
-            cmd.SetComputeFloatParam(Occlusion, IdCSoft, EdgeSoftness);
-            cmd.DispatchCompute(Occlusion, _splatKernel, gx, gy, gz);
+            using (_profiler.Sample(cmd, "Splat"))
+            {
+                // _VolMin / _VolSize are bound above, for every path.
+                cmd.SetComputeTextureParam(Occlusion, _splatKernel, IdCOcc, _volume);
+                cmd.SetComputeBufferParam(Occlusion, _splatKernel, IdCSpheres, _sphereBuffer);
+                cmd.SetComputeIntParam(Occlusion, IdCCount, _sphereCount);
+                cmd.SetComputeBufferParam(Occlusion, _splatKernel, IdCBoxes, _boxBuffer);
+                cmd.SetComputeIntParam(Occlusion, IdCBoxCount, _boxCount);
+                cmd.SetComputeFloatParam(Occlusion, IdCSoft, EdgeSoftness);
+                cmd.DispatchCompute(Occlusion, _splatKernel, gx, gy, gz);
+            }
         }
 
+        private static readonly int IdVoxTargetRT   = Shader.PropertyToID("_StageBeamVoxelizeRT");
         private static readonly int IdVoxVolMin     = Shader.PropertyToID("_VoxVolMin");
         private static readonly int IdVoxVolInvSize = Shader.PropertyToID("_VoxVolInvSize");
         private static readonly int IdVoxRes        = Shader.PropertyToID("_VoxRes");
-        private static readonly int IdVoxTargetRT   = Shader.PropertyToID("_StageBeamVoxelizeRT");
 
         /// <summary>
         /// Rasterizes the occluders' real meshes into the occupancy volume: three orthographic
@@ -698,6 +945,151 @@ namespace Origuma.StageBeam
         /// keeps the cost independent of the light count.
         /// </summary>
         private enum VoxClass { All, Static, Dynamic }
+
+        /// <summary>
+        /// Records compute-shader voxelization for every rasterizable SkinnedMeshRenderer whose
+        /// deformed vertex buffer is available on the GPU, and marks them so the raster axes skip
+        /// them. This is the draw-call eliminator: the raster path pays one DrawRenderer (its own
+        /// SetPass each) per renderer per axis; a dispatch pays none, and covers all axes at once.
+        /// </summary>
+        private void RecordComputeSkinned(CommandBuffer cmd, RenderTexture target)
+        {
+            if (_computeHandled == null || _computeHandled.Length < _occluders.Count)
+                _computeHandled = new bool[Mathf.Max(_occluders.Count, 8)];
+            System.Array.Clear(_computeHandled, 0, _computeHandled.Length);
+            _statComputeSkinned = 0;
+            _statSkinnedDispatches = 0;
+            _statSkinnedTris = 0;
+
+            if (!ComputeSkinnedVoxelize || _triKernel < 0 || target == null) return;
+
+            using var _sk = _profiler.Sample(cmd, "SkinnedCompute");
+            bool boundVolume = false;
+            for (int i = 0; i < _occluders.Count; i++)
+            {
+                if (_voxelizeFlags == null || i >= _voxelizeFlags.Length || !_voxelizeFlags[i]) continue;
+                if (!(_occluders[i] is SkinnedMeshRenderer smr)) continue;
+                var mesh = smr.sharedMesh;
+                if (mesh == null) continue;
+                // Exotic layout (position outside stream 0 — the stream skinning deforms):
+                // leave the renderer on the raster path rather than read garbage.
+                if (mesh.GetVertexAttributeStream(UnityEngine.Rendering.VertexAttribute.Position) != 0)
+                    continue;
+
+                // The skinned output and the index buffer need raw (ByteAddressBuffer) access.
+                // Enabling the target can take a frame to materialise, during which
+                // GetVertexBuffer returns null — the renderer simply rasterizes as before and
+                // joins this path on the next build.
+                bool hadRaw = (smr.vertexBufferTarget & GraphicsBuffer.Target.Raw) != 0;
+                if (!hadRaw) smr.vertexBufferTarget |= GraphicsBuffer.Target.Raw;
+                if ((mesh.indexBufferTarget & GraphicsBuffer.Target.Raw) == 0)
+                    mesh.indexBufferTarget |= GraphicsBuffer.Target.Raw;
+
+                var vb = smr.GetVertexBuffer();
+                if (vb == null)
+                {
+                    // Null on the very first attempt is the expected warm-up; null while raw
+                    // access was already on means GPU skinning itself is unavailable.
+                    if (hadRaw && !_warnedNoSkinBuffer)
+                    {
+                        _warnedNoSkinBuffer = true;
+                        Debug.LogWarning("[StageBeam] SkinnedMeshRenderer.GetVertexBuffer() " +
+                            "returned null — GPU skinning appears unavailable (Project Settings > " +
+                            "Player > GPU Skinning). Skinned occluders fall back to rasterized " +
+                            "voxelization: one draw call per renderer per axis.");
+                    }
+                    continue;
+                }
+                var ib = mesh.GetIndexBuffer();
+                if (ib == null) { vb.Dispose(); continue; }
+
+                _buffersThisBuild.Add(vb);
+                _buffersThisBuild.Add(ib);
+
+                if (!boundVolume)
+                {
+                    cmd.SetComputeTextureParam(Occlusion, _triKernel, IdCOcc, target);
+                    boundVolume = true;
+                }
+
+                // Layout comes from the DATA, not assumptions. The skin output shares stream 0's
+                // layout (skinning deforms stream 0 and copies anything else there through), so
+                // the mesh's stream-0 stride and position offset are authoritative — and the
+                // buffer's own stride wins outright when available: it describes the actual
+                // allocation. A hand-derived pos+normal+tangent guess sat here once and read
+                // garbage on any mesh whose stream 0 carried more than that.
+                int stride = vb.stride >= 12 ? vb.stride : mesh.GetVertexBufferStride(0);
+                int posOffset = Mathf.Max(0, mesh.GetVertexAttributeOffset(
+                    UnityEngine.Rendering.VertexAttribute.Position));
+
+                cmd.SetComputeBufferParam(Occlusion, _triKernel, IdTriVerts, vb);
+                cmd.SetComputeBufferParam(Occlusion, _triKernel, IdTriIndices, ib);
+                cmd.SetComputeIntParam(Occlusion, IdTriVertStride, stride);
+                cmd.SetComputeIntParam(Occlusion, IdTriPosOffset, posOffset);
+                cmd.SetComputeIntParam(Occlusion, IdTriIndex16,
+                    mesh.indexFormat == UnityEngine.Rendering.IndexFormat.UInt16 ? 1 : 0);
+                // GPU skinning outputs vertices relative to the renderer's skinning ROOT — the
+                // root bone when one is assigned, else the renderer's own transform. This is the
+                // same matrix VFX Graph's "Get Skinned Mesh World Root Transform" supplies for
+                // exactly this reconstruction; multiplying by smr.transform instead put every
+                // vertex in the wrong place (the classic tell: moving an SMR's own transform
+                // doesn't move the rendered mesh — bones, not the SMR node, define its space).
+                var skinRoot = smr.rootBone != null ? smr.rootBone : smr.transform;
+                cmd.SetComputeMatrixParam(Occlusion, IdTriLocalToWorld,
+                    skinRoot.localToWorldMatrix);
+
+                // Submeshes are contiguous ranges of one index buffer, so when they all share a
+                // baseVertex (the overwhelmingly common case) the whole renderer is ONE range and
+                // one dispatch. Occupancy does not care which material a triangle belongs to, and
+                // dispatch overhead is per-call — with ~90 skinned renderers, dispatching per
+                // submesh instead multiplies a fixed cost by the material count for no benefit.
+                int spanStart = int.MaxValue, spanEnd = 0, spanBase = 0, spanTris = 0;
+                bool uniformBase = true, anyTris = false;
+                for (int sm = 0; sm < mesh.subMeshCount; sm++)
+                {
+                    var d = mesh.GetSubMesh(sm);
+                    if (d.topology != MeshTopology.Triangles || d.indexCount < 3) continue;
+                    if (!anyTris) { spanBase = d.baseVertex; anyTris = true; }
+                    else if (d.baseVertex != spanBase) { uniformBase = false; }
+                    spanStart = Mathf.Min(spanStart, d.indexStart);
+                    spanEnd = Mathf.Max(spanEnd, d.indexStart + d.indexCount);
+                    spanTris += d.indexCount / 3;
+                }
+                if (!anyTris) continue;
+
+                if (uniformBase)
+                {
+                    Dispatch(cmd, spanStart, spanEnd - spanStart, spanBase);
+                }
+                else
+                {
+                    // Mixed baseVertex: each range needs its own offset, so fall back to per-submesh.
+                    for (int sm = 0; sm < mesh.subMeshCount; sm++)
+                    {
+                        var d = mesh.GetSubMesh(sm);
+                        if (d.topology != MeshTopology.Triangles || d.indexCount < 3) continue;
+                        Dispatch(cmd, d.indexStart, d.indexCount, d.baseVertex);
+                    }
+                }
+
+                _computeHandled[i] = true;
+                _statComputeSkinned++;
+                _statSkinnedTris += spanTris;
+            }
+        }
+
+        // One triangle-voxelize dispatch over an index range. Counted so the report can tell
+        // dispatch-overhead-bound from triangle-work-bound: those need opposite fixes (fewer
+        // dispatches vs. fewer samples per triangle), and the totals alone cannot distinguish them.
+        private void Dispatch(CommandBuffer cmd, int indexStart, int indexCount, int baseVertex)
+        {
+            cmd.SetComputeIntParam(Occlusion, IdTriIndexStart, indexStart);
+            cmd.SetComputeIntParam(Occlusion, IdTriIndexCount, indexCount);
+            cmd.SetComputeIntParam(Occlusion, IdTriBaseVertex, baseVertex);
+            cmd.DispatchCompute(Occlusion, _triKernel,
+                Mathf.CeilToInt(indexCount / 3f / 64f), 1, 1);
+            _statSkinnedDispatches++;
+        }
 
         private void RecordVoxelizeMeshes(CommandBuffer cmd)
         {
@@ -733,6 +1125,15 @@ namespace Origuma.StageBeam
 
             ClassifyAndFlag();
 
+            // Skinned renderers go through the compute path first (zero draw calls); whatever it
+            // marks as handled, the raster axes below skip. Skinned occupancy is always dynamic,
+            // so it writes _volume — cleared by RecordUploadAndDispatch — in both split modes.
+            RecordComputeSkinned(cmd, _volume);
+
+            // Timed separately from SkinnedCompute, not around it: a scope that CONTAINS another
+            // double-counts in the report's total and hides which of the two costs anything.
+            using var _raster = _profiler.Sample(cmd, "RasterVoxelize");
+
             bool split = StaticDynamicSplit && _combineKernel >= 0 && _clearKernel >= 0 && EnsureStaticVolume();
             if (split)
             {
@@ -744,6 +1145,7 @@ namespace Origuma.StageBeam
                     DispatchClear(cmd, _volumeStatic);
                     VoxelizeAxes(cmd, _volumeStatic, VoxClass.Static);
                     _staticVolumeValid = true;
+                    _statRebuiltStatic = true;
                 }
                 // _volume was already cleared by RecordUploadAndDispatch (Clear + empty Splat).
                 VoxelizeAxes(cmd, _volume, VoxClass.Dynamic);
@@ -765,35 +1167,80 @@ namespace Origuma.StageBeam
             int n = _occluders.Count;
             if (_voxelizeFlags == null || _voxelizeFlags.Length < n) _voxelizeFlags = new bool[Mathf.Max(n, 8)];
 
+            _statBuilds++;
+            // Stats are reset BEFORE the classification below computes them. An earlier revision
+            // reset _statMatrixReset here, AFTER the doSplit block had already recorded it — so
+            // the report unconditionally printed "reset: no" and hid the very condition it was
+            // added to reveal.
+            _staticDirty = false;
+            _statOccluders = 0;
+            _statDynamic = 0;
+            _statDynSkinned = 0;
+            _statMatrixReset = false;
+            _statMovedMeshes = 0;
+            _statMaxMovedDelta = 0f;
+            _statMaxMovedRenderer = null;
+
             bool doSplit = StaticDynamicSplit;
-            bool matricesReset = false;   // first build (or post-rescan) → treat every occluder as moved
             if (doSplit)
             {
                 if (_dynamicFlags == null || _dynamicFlags.Length < n)
-                {
                     _dynamicFlags = new bool[Mathf.Max(n, 8)];
-                    _wasDynamic  = new bool[Mathf.Max(n, 8)];
-                }
-                matricesReset = _lastMatrices == null || _lastMatrices.Length < n;
-                if (matricesReset) _lastMatrices = new Matrix4x4[Mathf.Max(n, 8)];
+                // Empty history = the first build of this builder: nothing to compare against,
+                // so everything classifies dynamic exactly once. Rescans no longer empty it —
+                // history is keyed by renderer identity and survives list rebuilds (see Rescan).
+                _statMatrixReset = _moveHistory.Count == 0;
+                if (_occluderSetShrunk) { _staticDirty = true; _occluderSetShrunk = false; }
             }
-
-            _staticDirty = false;
             for (var i = 0; i < n; i++)
             {
                 var r = _occluders[i];
                 bool active = r != null && r.enabled && r.gameObject.activeInHierarchy;
-                _voxelizeFlags[i] = active &&
-                    (MaxOccluderSize <= 0f || r.bounds.extents.magnitude * 2f <= MaxOccluderSize);
+                // A hinted subtree already contributed its authored shape via the compute splat —
+                // rasterizing it too would double the occupancy and cost a draw call per renderer.
+                bool hinted = _hintCovered != null && i < _hintCovered.Length && _hintCovered[i];
+                // Size gate. Skinned meshes must NOT be judged by r.bounds: cloth/culling systems
+                // (MagicaCloth among them) inflate skinned bounds on purpose, and the raw test
+                // silently rejected a whole performer as "floor-sized" — the character then cast
+                // no mesh occupancy at all and the shadow degraded to the union of whatever small
+                // accessory renderers still fit under the cap, which reads as a cluster of balls.
+                // GatherOccluders documents this exact trap for the AutoFit path (bone positions,
+                // never renderer bounds); this is the same rule applied to raster eligibility.
+                bool sizeOk = MaxOccluderSize <= 0f;
+                if (!sizeOk && active)
+                {
+                    if (r is SkinnedMeshRenderer sk && TryComputeSkeletonBounds(sk, out var skel))
+                        sizeOk = skel.extents.magnitude * 2f <= MaxOccluderSize;
+                    else
+                        sizeOk = r.bounds.extents.magnitude * 2f <= MaxOccluderSize;
+                }
+                _voxelizeFlags[i] = active && !hinted && sizeOk;
+
+                if (_voxelizeFlags[i]) _statOccluders++;
 
                 if (!doSplit) continue;   // dynamic classification only needed for the split
                 Matrix4x4 m = r != null ? r.transform.localToWorldMatrix : Matrix4x4.identity;
-                bool moved = matricesReset || m != _lastMatrices[i];
-                _lastMatrices[i] = m;
+                MoveEntry prev = default;
+                bool hasHistory = r != null && _moveHistory.TryGetValue(r, out prev);
+                bool moved = !hasHistory || m != prev.Matrix;
+                // Measure the movers. History is identity-keyed, so this is a real comparison
+                // even on the build right after a rescan.
+                if (moved && hasHistory && active && _voxelizeFlags[i] &&
+                    !(r is SkinnedMeshRenderer))
+                {
+                    _statMovedMeshes++;
+                    float d = MaxAbsElementDelta(in m, in prev.Matrix);
+                    if (d > _statMaxMovedDelta) { _statMaxMovedDelta = d; _statMaxMovedRenderer = r; }
+                }
                 bool dyn = active && ((r is SkinnedMeshRenderer) || moved);
-                if (dyn != _wasDynamic[i]) _staticDirty = true;
+                if (dyn != (hasHistory && prev.WasDynamic)) _staticDirty = true;
                 _dynamicFlags[i] = dyn;
-                _wasDynamic[i]   = dyn;
+                if (r != null) _moveHistory[r] = new MoveEntry { Matrix = m, WasDynamic = dyn };
+                if (dyn && _voxelizeFlags[i])
+                {
+                    _statDynamic++;
+                    if (r is SkinnedMeshRenderer) _statDynSkinned++;
+                }
             }
         }
 
@@ -813,6 +1260,7 @@ namespace Origuma.StageBeam
 
         private void DispatchClear(CommandBuffer cmd, RenderTexture vol)
         {
+            using var _s = _profiler.Sample(cmd, "ClearStatic");
             var res = Resolution;
             cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
             cmd.SetComputeTextureParam(Occlusion, _clearKernel, IdCOcc, vol);
@@ -822,6 +1270,7 @@ namespace Origuma.StageBeam
 
         private void DispatchCombine(CommandBuffer cmd, RenderTexture target, RenderTexture other)
         {
+            using var _s = _profiler.Sample(cmd, "CombineMax");
             var res = Resolution;
             cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
             cmd.SetComputeTextureParam(Occlusion, _combineKernel, IdCOcc, target);
@@ -861,13 +1310,18 @@ namespace Origuma.StageBeam
             {
                 // Active + not-too-big (from ClassifyAndFlag), then the requested static/dynamic class.
                 if (_voxelizeFlags == null || i >= _voxelizeFlags.Length || !_voxelizeFlags[i]) continue;
+                // Already written by the compute path — a raster draw here would be pure waste.
+                if (_computeHandled != null && i < _computeHandled.Length && _computeHandled[i]) continue;
                 if (cls == VoxClass.Static  &&  _dynamicFlags[i]) continue;
                 if (cls == VoxClass.Dynamic && !_dynamicFlags[i]) continue;
                 var r = _occluders[i];
                 int subs = _occluderSubMeshes != null && i < _occluderSubMeshes.Length
                     ? _occluderSubMeshes[i] : 1;
                 for (int sm = 0; sm < subs; sm++)
+                {
                     cmd.DrawRenderer(r, _voxelizeMat, sm, 0);
+                    _statDraws++;
+                }
             }
         }
 
@@ -898,10 +1352,18 @@ namespace Origuma.StageBeam
             cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
 
             // 2× GrowMax (fill/thicken) then 2× blur (smooth) — ping-pong, ends in _volume.
-            Pass(cmd, _growKernel >= 0 ? _growKernel : _dilateKernel, _volume, _volumeTemp, gx, gy, gz);
-            Pass(cmd, _growKernel >= 0 ? _growKernel : _dilateKernel, _volumeTemp, _volume, gx, gy, gz);
-            Pass(cmd, _dilateKernel, _volume, _volumeTemp, gx, gy, gz);
-            Pass(cmd, _dilateKernel, _volumeTemp, _volume, gx, gy, gz);
+            // Timed separately: they are four full-volume passes and the likeliest place left to
+            // find real time, so "grow" and "blur" must be distinguishable in the report.
+            using (_profiler.Sample(cmd, "GrowMax x2"))
+            {
+                Pass(cmd, _growKernel >= 0 ? _growKernel : _dilateKernel, _volume, _volumeTemp, gx, gy, gz);
+                Pass(cmd, _growKernel >= 0 ? _growKernel : _dilateKernel, _volumeTemp, _volume, gx, gy, gz);
+            }
+            using (_profiler.Sample(cmd, "Blur x2"))
+            {
+                Pass(cmd, _dilateKernel, _volume, _volumeTemp, gx, gy, gz);
+                Pass(cmd, _dilateKernel, _volumeTemp, _volume, gx, gy, gz);
+            }
         }
 
         private void Pass(CommandBuffer cmd, int kernel, RenderTexture src, RenderTexture dst,
@@ -946,11 +1408,14 @@ namespace Origuma.StageBeam
             float alpha = reAnchored ? 1f : Mathf.Clamp01(1f - TemporalSmoothing);
             var res = Resolution;
             int gx = Mathf.CeilToInt(res.x / 4f), gy = Mathf.CeilToInt(res.y / 4f), gz = Mathf.CeilToInt(res.z / 4f);
-            cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
-            cmd.SetComputeFloatParam(Occlusion, IdCTemporalAlpha, alpha);
-            cmd.SetComputeTextureParam(Occlusion, _temporalKernel, IdCCurrent, _volume);
-            cmd.SetComputeTextureParam(Occlusion, _temporalKernel, IdCOcc, _volumeHistory);
-            cmd.DispatchCompute(Occlusion, _temporalKernel, gx, gy, gz);
+            using (_profiler.Sample(cmd, "Temporal"))
+            {
+                cmd.SetComputeIntParams(Occlusion, IdCRes, res.x, res.y, res.z);
+                cmd.SetComputeFloatParam(Occlusion, IdCTemporalAlpha, alpha);
+                cmd.SetComputeTextureParam(Occlusion, _temporalKernel, IdCCurrent, _volume);
+                cmd.SetComputeTextureParam(Occlusion, _temporalKernel, IdCOcc, _volumeHistory);
+                cmd.DispatchCompute(Occlusion, _temporalKernel, gx, gy, gz);
+            }
             return _volumeHistory;
         }
 

@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 namespace Origuma.StageBeam
 {
@@ -64,42 +65,83 @@ namespace Origuma.StageBeam
         [Tooltip("Softness of the beam's outer edge (side falloff).")]
         [Range(0.01f, 1f)] public float EdgeSoftness = 0.35f;
 
-        [Tooltip("Overall volume density.")]
-        [Range(0f, 4f)] public float Density = 1f;
-
-        [Tooltip("Scattering anisotropy (Henyey-Greenstein g). 0 = uniform brightness from " +
-                 "every viewing angle. 0.5-0.7 = forward scattering: beams pointing at the " +
-                 "camera flare up, the way real haze reads under stage lighting.")]
-        [Range(-0.9f, 0.9f)] public float Anisotropy;
-
-        [Tooltip("How strongly the beam fades along its length (0 = no fade, 2 = fades fast).")]
-        [Range(0f, 2f)] public float AxialFalloff = 1f;
-
-        [Tooltip("Strength of the bright core inside the beam (hotspot) angle.")]
-        [Range(0f, 4f)] public float Hotspot = 1f;
-
-        [Tooltip("Extra brightness boost near the lens (source flare/glare). 0 = off.")]
-        [Range(0f, 6f)] public float RootBoost;
-
-        [Tooltip("Length of the root glare as a fraction of Range.")]
-        [Range(0.01f, 0.5f)] public float RootBoostFrac = 0.1f;
-
-        [Tooltip("How much of the root glare desaturates toward white vs. tints with Color.")]
-        [Range(0f, 1f)] public float RootWhite = 0.6f;
+        [Tooltip("How this beam reads: density, scattering, hotspot and lens glare.")]
+        public StageBeamLook Look = StageBeamLook.Default;
 
         [Header("Quality")]
-        [Tooltip("Raymarch sample count. Higher = smoother gradients, more cost.")]
-        [Range(1, 128)] public int RaymarchSteps = 24;
-
         [Tooltip("Real spot Light co-located with this fixture (shadows enabled). With the " +
                  "renderer feature's Shadows = LightShadowMap, the beam samples ITS shadow " +
                  "map — geometry-exact volumetric shadows. Empty = a shadowed spot Light on " +
                  "this GameObject or its children is used automatically if one exists.")]
         public Light ShadowLight;
 
-        [Tooltip("Clip the beam against scene depth (so it stops at walls/floors) instead of " +
-                 "passing through solid geometry.")]
-        public bool DepthOcclude = true;
+        // --- Superseded by Look, kept only so existing scenes and prefabs carry their values over.
+        // Each maps from the field name it had when it lived here, so a scene authored before the
+        // struct still deserialises; MigrateLook copies them across exactly once.
+        //
+        // INITIALISED FROM THE STRUCT, never with a literal. A scene that predates the struct has
+        // every one of these keys in its YAML, so its own values win and these initialisers are
+        // dead — they are reached ONLY by a component that never had the old fields, i.e. a fresh
+        // one, whose Look then has to come out identical to StageBeamLook.Default. Written as
+        // literals they had already drifted from it in two places (Anisotropy 0 vs 0.6,
+        // RaymarchSteps 24 vs 48), so every StageBeamLight added after the struct landed was
+        // migrated straight back off the defaults it was born with — isotropic scattering and
+        // half the samples, silently, on the exact path this struct exists to keep consistent.
+        [SerializeField, HideInInspector, FormerlySerializedAs("Density")]        private float _oldDensity = StageBeamLook.Default.Density;
+        [SerializeField, HideInInspector, FormerlySerializedAs("Anisotropy")]     private float _oldAnisotropy = StageBeamLook.Default.Anisotropy;
+        [SerializeField, HideInInspector, FormerlySerializedAs("AxialFalloff")]   private float _oldAxialFalloff = StageBeamLook.Default.AxialFalloff;
+        [SerializeField, HideInInspector, FormerlySerializedAs("Hotspot")]        private float _oldHotspot = StageBeamLook.Default.Hotspot;
+        [SerializeField, HideInInspector, FormerlySerializedAs("RootBoost")]      private float _oldRootBoost = StageBeamLook.Default.RootGlare;
+        [SerializeField, HideInInspector, FormerlySerializedAs("RaymarchSteps")]  private int   _oldRaymarchSteps = StageBeamLook.Default.RaymarchSteps;
+        [SerializeField, HideInInspector, FormerlySerializedAs("DepthOcclude")]   private bool  _oldDepthOcclude = StageBeamLook.Default.DepthOcclude;
+        [SerializeField, HideInInspector] private bool _lookMigrated;
+
+        /// <summary>
+        /// One-shot copy of the pre-struct fields into <see cref="Look"/>. Safe to run on a fresh
+        /// component because the legacy defaults are taken FROM the struct's defaults above; the
+        /// flag exists so a look edited AFTER migrating is never stomped by a second pass.
+        ///
+        /// Does not repair a component that already migrated under the drifted literals — its
+        /// Look and its migrated flag are both serialised by then. Those need the value set by
+        /// hand (or the component re-added).
+        /// </summary>
+        private void MigrateLook()
+        {
+            if (_lookMigrated) return;
+            _lookMigrated = true;
+            Look = new StageBeamLook
+            {
+                Density       = _oldDensity,
+                Anisotropy    = _oldAnisotropy,
+                AxialFalloff  = _oldAxialFalloff,
+                Hotspot       = _oldHotspot,
+                // Strength carries over; the old reach/white values don't — RootGlare fixed them
+                // at the defaults (0.1 / 0.6), which is what these fields held anyway.
+                RootGlare     = _oldRootBoost,
+                RaymarchSteps = _oldRaymarchSteps,
+                DepthOcclude  = _oldDepthOcclude,
+            };
+        }
+
+#if UNITY_EDITOR
+        private void OnValidate() => MigrateLook();
+#endif
+
+        // --- Scripting shims. The values moved into Look; these keep `light.Hotspot = x` compiling.
+        /// <inheritdoc cref="StageBeamLook.Density"/>
+        public float Density { get => Look.Density; set => Look.Density = value; }
+        /// <inheritdoc cref="StageBeamLook.Anisotropy"/>
+        public float Anisotropy { get => Look.Anisotropy; set => Look.Anisotropy = value; }
+        /// <inheritdoc cref="StageBeamLook.AxialFalloff"/>
+        public float AxialFalloff { get => Look.AxialFalloff; set => Look.AxialFalloff = value; }
+        /// <inheritdoc cref="StageBeamLook.Hotspot"/>
+        public float Hotspot { get => Look.Hotspot; set => Look.Hotspot = value; }
+        /// <inheritdoc cref="StageBeamLook.RootGlare"/>
+        public float RootGlare { get => Look.RootGlare; set => Look.RootGlare = value; }
+        /// <inheritdoc cref="StageBeamLook.RaymarchSteps"/>
+        public int RaymarchSteps { get => Look.RaymarchSteps; set => Look.RaymarchSteps = value; }
+        /// <inheritdoc cref="StageBeamLook.DepthOcclude"/>
+        public bool DepthOcclude { get => Look.DepthOcclude; set => Look.DepthOcclude = value; }
 
         [Header("Gobo")]
         [Tooltip("Optional single gobo texture projected through the beam. None = plain cone.")]
@@ -137,6 +179,10 @@ namespace Origuma.StageBeam
 
         private void OnEnable()
         {
+            // Also here, not only in OnValidate: OnValidate is EDITOR-ONLY, so a scene saved before
+            // the look moved into a struct would reach a player build with its legacy values intact
+            // and its DefaultLook still at the struct's defaults — rendering a look nobody chose.
+            MigrateLook();
             _driver = StageBeamDriver.EnsureInstance();
             _driver.AddSource(this);
         }
@@ -189,15 +235,6 @@ namespace Origuma.StageBeam
                 EdgeSoftness = EdgeSoftness,
                 FieldHalfAngleRad = fieldHalfRad,
                 BeamHalfAngleRad = beamHalfRad,
-                Density = Density,
-                Anisotropy = Anisotropy,
-                RaymarchSteps = RaymarchSteps,
-                DepthOcclude = DepthOcclude ? 1f : 0f,
-                AxialFalloff = AxialFalloff,
-                Hotspot = Hotspot,
-                RootBoost = RootBoost,
-                RootBoostFrac = RootBoostFrac,
-                RootWhite = RootWhite,
                 GoboArray = goboArray,
                 GoboSlice = goboSlice,
                 GoboRotationRad = (GoboRotationDeg + _goboRotationRuntimeDeg) * Mathf.Deg2Rad,
@@ -206,6 +243,10 @@ namespace Origuma.StageBeam
                 GoboRotationRad2 = 0f,
                 GoboOffset = _goboOffsetRuntime
             });
+            // The look half in one call, so a new dial never has to be threaded through here.
+            var built = beams[beams.Count - 1];
+            Look.ApplyTo(ref built);
+            beams[beams.Count - 1] = built;
         }
 
         /// <summary>

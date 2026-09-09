@@ -4,14 +4,20 @@ namespace Origuma.StageBeam
 {
     /// <summary>
     /// Explicit volumetric-shadow shape for everything under this transform, overriding the
-    /// automatic per-renderer guessing (bounds boxes / bone spheres). Put ONE on a character
-    /// root and every renderer below it — body, hair, clothes, cloth-sim proxies — is
-    /// represented by this single, stable, VISIBLE shape instead.
+    /// automatic per-renderer guessing (bounds boxes / bone spheres) AND taking those renderers
+    /// out of mesh voxelization. Put one on a character root — or on a whole cast's root, since
+    /// HumanoidCapsules covers every humanoid below it — and body, hair, clothes and cloth-sim
+    /// proxies are all represented by the authored shapes instead.
     ///
     /// This is the answer for rigs the automatic path can't read well (e.g. MagicaCloth
     /// characters, whose extra cloth bones/renderers skew bone sampling and inflate bounds):
     /// the occluder becomes exactly the capsule you see in the Scene view — nothing hidden,
     /// nothing frame-dependent.
+    ///
+    /// It is also the cost lever. Mesh voxelization spends a draw call per renderer per axis, so a
+    /// cast of dancers is hundreds of them; a hint replaces that with a compute splat that costs
+    /// none. The trade is silhouette accuracy — capsules instead of the real deforming mesh.
+    /// Shapes are budgeted by the builder's MaxOccluders (an articulated humanoid is ~17).
     /// </summary>
     [AddComponentMenu("Rendering/Stage Beam Occluder Hint")]
     [DisallowMultipleComponent]
@@ -28,14 +34,16 @@ namespace Origuma.StageBeam
             Ignore,
             /// <summary>Capsules along the HUMANOID skeleton (torso, head, arms, legs) — the
             /// articulated option for characters: follows animation exactly, and the Humanoid
-            /// mapping never includes cloth/hair bones, so cloth sims can't skew it. Falls back
-            /// to the single Capsule when no humanoid Animator is found below this object.</summary>
+            /// mapping never includes cloth/hair bones, so cloth sims can't skew it. Covers EVERY
+            /// humanoid below this object, so one hint can represent a whole cast. Falls back to
+            /// the single Capsule when no humanoid Animator is found below it.</summary>
             HumanoidCapsules,
         }
 
         [Tooltip("HumanoidCapsules = articulated character shadow from the Humanoid avatar " +
-                 "(best for characters; immune to cloth/hair bones). Capsule = one coarse " +
-                 "capsule. Box = set pieces. Ignore = exclude from volumetric shadows.")]
+                 "(best for characters; immune to cloth/hair bones; covers every humanoid below " +
+                 "this object). Capsule = one coarse capsule. Box = set pieces. " +
+                 "Ignore = exclude from volumetric shadows.")]
         public OccluderShape Shape = OccluderShape.HumanoidCapsules;
 
         [Tooltip("HumanoidCapsules: base limb radius in metres (arms). Torso/legs/head use " +
@@ -87,11 +95,30 @@ namespace Origuma.StageBeam
             (HumanBodyBones.Hips,          HumanBodyBones.RightUpperLeg, 1.5f),
         };
 
-        /// <summary>Buffer size callers should use for <see cref="FillHumanoidSegments"/>.</summary>
+        /// <summary>Segments ONE humanoid contributes. Callers should size their buffer by
+        /// <see cref="HumanoidSegmentCapacity"/>, which accounts for every character below.</summary>
         public const int MaxSegments = 24;
 
-        private Animator _animator;
-        private Transform[] _boneA, _boneB;
+        /// <summary>
+        /// Buffer size <see cref="FillHumanoidSegments"/> needs to represent EVERY humanoid below
+        /// this hint. One hint on a cast of dancers is the natural way to author it, so the count
+        /// scales with the characters found — a fixed 24 would silently drop all but the first.
+        /// </summary>
+        public int HumanoidSegmentCapacity
+        {
+            get
+            {
+                if (_animators == null) CacheHumanoid();
+                return Mathf.Max(MaxSegments,
+                    (_animators != null ? _animators.Length : 0) * HumanoidPairs.Length);
+            }
+        }
+
+        // Every humanoid below this hint, not just the first. A hint dropped on a group root used
+        // to represent only one character while EXCLUDING the whole group from mesh voxelization,
+        // so the rest of the cast silently stopped casting any shadow at all.
+        private Animator[] _animators;
+        private Transform[] _boneA, _boneB;   // flattened: [animator * pairs + pair]
 
         /// <summary>
         /// Fills world-space humanoid segments into <paramref name="dest"/> and returns the
@@ -101,44 +128,73 @@ namespace Origuma.StageBeam
         public int FillHumanoidSegments(Segment[] dest)
         {
             if (_boneA == null && !CacheHumanoid()) return 0;
-            if (_animator == null || !_animator.isActiveAndEnabled) { _boneA = null; return 0; }
 
+            int pairs = HumanoidPairs.Length;
             int n = 0;
-            for (int i = 0; i < _boneA.Length && n < dest.Length; i++)
+            for (int a = 0; a < _animators.Length && n < dest.Length; a++)
             {
-                var a = _boneA[i];
-                var b = _boneB[i];
-                if (a == null || b == null) continue;
-                dest[n++] = new Segment
+                var anim = _animators[a];
+                if (anim == null) { _boneA = null; return 0; }   // destroyed → re-cache next build
+                if (!anim.isActiveAndEnabled) continue;          // hidden character casts nothing
+
+                for (int i = 0; i < pairs && n < dest.Length; i++)
                 {
-                    A = a.position,
-                    B = b.position,
-                    Radius = Mathf.Max(0.01f, LimbRadius * HumanoidPairs[i].r),
-                };
+                    var ba = _boneA[a * pairs + i];
+                    var bb = _boneB[a * pairs + i];
+                    if (ba == null || bb == null) continue;
+                    dest[n++] = new Segment
+                    {
+                        A = ba.position,
+                        B = bb.position,
+                        Radius = Mathf.Max(0.01f, LimbRadius * HumanoidPairs[i].r),
+                    };
+                }
             }
             return n;
         }
 
         private bool CacheHumanoid()
         {
-            _animator = GetComponentInChildren<Animator>(true);
-            if (_animator == null || !_animator.isHuman) { _animator = null; return false; }
+            var found = GetComponentsInChildren<Animator>(true);
+            int humans = 0;
+            for (int i = 0; i < found.Length; i++)
+                if (found[i] != null && found[i].isHuman) humans++;
+            if (humans == 0) { _animators = null; return false; }
 
-            _boneA = new Transform[HumanoidPairs.Length];
-            _boneB = new Transform[HumanoidPairs.Length];
-            for (int i = 0; i < HumanoidPairs.Length; i++)
+            _animators = new Animator[humans];
+            for (int i = 0, w = 0; i < found.Length; i++)
+                if (found[i] != null && found[i].isHuman) _animators[w++] = found[i];
+
+            int pairs = HumanoidPairs.Length;
+            _boneA = new Transform[humans * pairs];
+            _boneB = new Transform[humans * pairs];
+            for (int a = 0; a < humans; a++)
             {
-                var a = _animator.GetBoneTransform(HumanoidPairs[i].a);
-                var b = _animator.GetBoneTransform(HumanoidPairs[i].b);
-                // Optional bones (Chest/Neck): bridge over missing links so the torso chain
-                // stays connected — fall back to the other end.
-                _boneA[i] = a != null ? a : b;
-                _boneB[i] = b != null ? b : a;
+                for (int i = 0; i < pairs; i++)
+                {
+                    var ba = _animators[a].GetBoneTransform(HumanoidPairs[i].a);
+                    var bb = _animators[a].GetBoneTransform(HumanoidPairs[i].b);
+                    // Optional bones (Chest/Neck): bridge over missing links so the torso chain
+                    // stays connected — fall back to the other end.
+                    _boneA[a * pairs + i] = ba != null ? ba : bb;
+                    _boneB[a * pairs + i] = bb != null ? bb : ba;
+                }
             }
             return true;
         }
 
-        private void OnValidate() => _boneA = null;   // re-resolve after edits
+        /// <summary>Number of humanoid characters this hint represents (0 = falls back to the
+        /// single authored capsule). Surfaced so the inspector can say so out loud.</summary>
+        public int HumanoidCount
+        {
+            get
+            {
+                if (_animators == null) CacheHumanoid();
+                return _animators != null ? _animators.Length : 0;
+            }
+        }
+
+        private void OnValidate() { _boneA = null; _animators = null; }   // re-resolve after edits
 
         // Emitted world-space capsule endpoints/radius for the builder (scale folded in).
         public void GetWorldCapsule(out Vector3 p0, out Vector3 p1, out float radius)

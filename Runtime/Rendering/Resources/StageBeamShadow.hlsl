@@ -155,7 +155,7 @@ float BeamShadow_ScreenSpace(float3 posWS, float3 lightWS, float jitter)
 // the sample) silently ended ~3 m out, so any beam sample further than that below an occluder
 // got no shadow at all and shafts faded out short instead of running the beam's full length.
 // ==============================================================================================
-float _StageBeamOccVoxel;    // smallest world voxel edge (kept bound for tooling; unused here)
+float _StageBeamOccVoxel;    // smallest world voxel edge — paces the volume march below
 
 // Clips [tMin, tMax] along posWS + t*dirL to the occupancy box. Returns false when the segment
 // misses the box entirely (no occluder can shadow this sample).
@@ -220,7 +220,18 @@ float BeamShadow_Volume(float3 posWS, float3 lightWS, float jitter)
     if (tMax <= tMin) return 1.0;
     if (!StageBeamClipToOccBox(posWS, dirL, tMin, tMax)) return 1.0;
 
-    int   steps = max((int)_BeamShadowSteps, 1);
+    // The step pitch is anchored to the DATA, not to a dial: the volume cannot represent
+    // anything finer than a voxel, so ~2 voxels per step resolves everything it holds — while
+    // a march coarser than the occluder turns the shadow into a hit-PROBABILITY cloud (each
+    // pixel's jittered comb hits or misses a limb at random), which reads as a noisy round
+    // blob no matter how finely the body was voxelized. That was the "union of balls" look:
+    // a fixed step count spread over the whole box span (metres per step) undersampling
+    // 30 cm limbs. _BeamShadowSteps is now the COST CAP only — when the clipped span needs
+    // more samples than the cap allows, the pitch grows again (graceful degradation), so the
+    // cure for blobby shadows is a tighter box or more voxels, both of which shrink the pitch
+    // here automatically.
+    float pitch = max(2.0 * _StageBeamOccVoxel, 1e-3);
+    int   steps = clamp((int)ceil((tMax - tMin) / pitch), 1, max((int)_BeamShadowSteps, 1));
     float dt    = (tMax - tMin) / steps;
     // Jittered start (screen-space IGN from the caller) so coarse steps dither smoothly
     // instead of banding along the shaft.

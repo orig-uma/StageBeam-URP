@@ -12,6 +12,7 @@
 #pragma kernel Dilate
 #pragma kernel TemporalBlend
 #pragma kernel CombineMax
+#pragma kernel VoxelizeTriangles
 
 RWTexture3D<float> _Occ;           // R16F occupancy, 0 = clear, 1 = solid
 StructuredBuffer<float4> _Spheres; // xyz = centre (world), w = radius
@@ -163,4 +164,74 @@ void CombineMax(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= _Res)) return;
     _Occ[id] = max(_Occ[id], _CombineOther[id]);
+}
+
+// ------------------------------------------------------------------------------------------
+// Triangle voxelization — the DRAW-FREE path for renderers whose deformed vertices already
+// live on the GPU (SkinnedMeshRenderer.GetVertexBuffer after GPU skinning).
+//
+// The raster path costs one DrawRenderer per renderer PER AXIS, each carrying its own SetPass:
+// a cast of skinned performers alone is hundreds of draw calls per build. Here one dispatch
+// per renderer reads the skinned positions directly and writes the same occupancy — zero draw
+// calls, zero SetPass, and no per-axis multiplier because sampling is 3D, not a projection.
+//
+// One thread per triangle: sample the triangle surface at ~2 samples per voxel along its
+// edges (the raster path's "fragments denser than voxels" margin) and write each sample's
+// voxel. Like the raster path this produces a surface shell; the GrowMax fill that already
+// runs afterwards closes it into a solid, and also closes any pinholes the sampling leaves.
+ByteAddressBuffer _TriVerts;    // skinned vertex buffer; position = first 12 bytes of a vertex
+ByteAddressBuffer _TriIndices;  // index buffer of the SHARED mesh (16- or 32-bit)
+uint     _TriIndexStart;        // submesh: first index element
+uint     _TriIndexCount;        // submesh: index count (multiple of 3)
+uint     _TriBaseVertex;        // submesh: value added to every index
+uint     _TriIndex16;           // 1 = 16-bit indices
+uint     _TriVertStride;        // bytes per vertex in _TriVerts
+uint     _TriPosOffset;         // byte offset of the position inside a vertex
+float4x4 _TriLocalToWorld;      // skinning-root local -> world
+
+uint LoadTriIndex(uint element)
+{
+    if (_TriIndex16 != 0)
+    {
+        // 16-bit loads from a ByteAddressBuffer: fetch the aligned 32-bit word, pick the half.
+        uint byteAddr = element << 1;
+        uint word = _TriIndices.Load(byteAddr & ~3u);
+        return (byteAddr & 2u) != 0 ? (word >> 16) : (word & 0xffffu);
+    }
+    return _TriIndices.Load(element << 2);
+}
+
+// Vertex position in VOXEL space (continuous voxel coordinates).
+float3 LoadTriPosVox(uint vertexIndex)
+{
+    float3 p  = asfloat(_TriVerts.Load3(vertexIndex * _TriVertStride + _TriPosOffset));
+    float3 ws = mul(_TriLocalToWorld, float4(p, 1.0)).xyz;
+    return (ws - _VolMin) / max(_VolSize, 1e-4) * float3(_Res);
+}
+
+[numthreads(64,1,1)]
+void VoxelizeTriangles(uint3 id : SV_DispatchThreadID)
+{
+    uint first = id.x * 3;
+    if (first + 2 >= _TriIndexCount) return;
+
+    float3 v0 = LoadTriPosVox(LoadTriIndex(_TriIndexStart + first + 0) + _TriBaseVertex);
+    float3 v1 = LoadTriPosVox(LoadTriIndex(_TriIndexStart + first + 1) + _TriBaseVertex);
+    float3 v2 = LoadTriPosVox(LoadTriIndex(_TriIndexStart + first + 2) + _TriBaseVertex);
+
+    // Sample density ~2 per voxel along the longest edge. Clamped so one oversized triangle
+    // cannot stall its wavefront — character triangles are far smaller than a voxel (N=1-2);
+    // the clamp only bites on set-piece-sized geometry, which this path is not used for.
+    float3 e1 = v1 - v0;
+    float3 e2 = v2 - v0;
+    uint   N  = (uint)clamp(ceil(max(length(e1), length(e2)) * 2.0), 1.0, 48.0);
+    float  inv = 1.0 / N;
+
+    for (uint a = 0; a <= N; a++)
+    for (uint b = 0; b <= N - a; b++)
+    {
+        int3 c = (int3)floor(v0 + e1 * (a * inv) + e2 * (b * inv));
+        if (all(c >= 0) && all(c < (int3)_Res))
+            _Occ[c] = 1.0;   // races benign: every writer writes the same solid value
+    }
 }

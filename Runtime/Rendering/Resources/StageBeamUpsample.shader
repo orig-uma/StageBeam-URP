@@ -7,7 +7,16 @@ Shader "Origuma/StageBeamUpsample"
         Pass
         {
             Name "BeamUpsample"
-            Blend One One
+            // dst = src.rgb + dst * src.a — scattered light adds, and the alpha the fragment
+            // returns is the beam stack's TRANSMITTANCE, so the background behind a beam is
+            // dimmed by the haze it is seen through. With transmittance off the shader returns
+            // a = 1 and this is bit-for-bit the plain additive composite it replaced.
+            Blend One SrcAlpha
+            // The alpha is a blend FACTOR, not a value the camera wants. Masking the write keeps
+            // it out of the destination while the RGB blend still reads it — without this the pass
+            // would push transmittance into the camera's alpha channel, which downstream post
+            // (and anything compositing the camera output) reads as coverage.
+            ColorMask RGB
             ZWrite Off
             ZTest Always
             Cull Off
@@ -30,6 +39,13 @@ Shader "Origuma/StageBeamUpsample"
 
             // Anti-banding dither amplitude, as a FRACTION OF THE PIXEL'S VALUE. 0 = off.
             float _BeamDither;
+
+            // Optical depth accumulated by the beam passes (second MRT target, summed additively
+            // across every beam — see StageBeamConeCore.hlsl). 0 = this composite has no depth
+            // target bound (the decal/pool composite reuses this pass), so it returns a = 1 and
+            // the blend degenerates to plain additive.
+            TEXTURE2D_X(_BeamTauTex);
+            float _BeamTransmittance;
 
             // Interleaved gradient noise — a low-discrepancy per-pixel value, matched to what the
             // cone's raymarch jitter uses.
@@ -60,10 +76,23 @@ Shader "Origuma/StageBeamUpsample"
                 float2 p  = uv * res;                    // pixel position in low-res texel units
                 float2 tc = floor(p) + 0.5;              // nearest low-res texel center
 
+                // NO luminance guard here, deliberately — it was tried and reverted. This pass
+                // MAGNIFIES buffer texels to screen pixels, so a structure-preserving weight
+                // faithfully reproduces the buffer's texel STAIRCASE and the image reads as
+                // blocks; smoothing across texels is this filter's actual job. Structure
+                // preservation belongs one stage earlier, in the denoise pass, which runs at
+                // the buffer's own resolution where "structure" cannot be grid blocks.
                 half4 sum = 0;
                 float wSum = 0.0;
                 half4 nearestC = 0;
                 float nearestDiff = 1e30;
+                // Optical depth rides the SAME bilateral weights as the colour. It must: if the
+                // two were filtered differently, a silhouette pixel could take its scattered light
+                // from the near side of the edge and its occlusion from the far side, and the beam
+                // would darken a surface it does not cover.
+                float tauSum = 0.0;
+                float nearestTau = 0.0;
+                bool  useTau = _BeamTransmittance > 0.0;
 
                 UNITY_UNROLL
                 for (int j = -1; j <= 1; j++)
@@ -88,14 +117,24 @@ Shader "Origuma/StageBeamUpsample"
                         sum  += col * w;
                         wSum += w;
 
+                        float tj = useTau
+                            ? SAMPLE_TEXTURE2D_X_LOD(_BeamTauTex, sampler_LinearClamp, suv, 0).r
+                            : 0.0;
+                        tauSum += tj * w;
+
                         float diff = abs(zi - z0);
-                        if (diff < nearestDiff) { nearestDiff = diff; nearestC = col; }
+                        if (diff < nearestDiff)
+                        {
+                            nearestDiff = diff; nearestC = col; nearestTau = tj;
+                        }
                     }
                 }
 
                 // No neighbour matched this pixel's depth (thin feature the half-res grid
                 // stepped over) → take the single closest-depth texel instead of a bleed.
-                half4 outc = wSum > 1e-3 ? sum / wSum : nearestC;
+                bool  matched = wSum > 1e-3;
+                half4 outc = matched ? sum / wSum : nearestC;
+                float tau  = matched ? tauSum / wSum : nearestTau;
                 if (_BeamSoftCeiling > 0.0)
                 {
                     // Modulation-preserving ceiling. rgb = full beam total (haze × shadow),
@@ -126,6 +165,12 @@ Shader "Origuma/StageBeamUpsample"
                     float d = BeamIGN(input.positionCS.xy) - 0.5;
                     outc.rgb *= 1.0 + d * _BeamDither;
                 }
+
+                // Alpha stops being the modulation baseline here and becomes the BLEND FACTOR the
+                // pass declares (Blend One SrcAlpha): the transmittance of every beam stacked in
+                // front of this pixel. The baseline's only two consumers — the ceiling above and
+                // the denoise pass before it — have both already run, so the channel is free.
+                outc.a = useTau ? exp(-tau) : 1.0;
                 return outc;
             }
             ENDHLSL
@@ -162,6 +207,7 @@ Shader "Origuma/StageBeamUpsample"
                 float2 d  = _BeamUpsampleTexelSize.xy;
 
                 float z0 = LinearEyeDepth(SampleSceneDepth(uv), _ZBufferParams);
+                half4 c0 = SAMPLE_TEXTURE2D_X_LOD(_BlitTexture, sampler_LinearClamp, uv, 0);
 
                 half4 sum = 0;
                 float wSum = 0.0;
@@ -179,12 +225,22 @@ Shader "Origuma/StageBeamUpsample"
                         float wS  = exp(-(i * i + j * j) * 0.22);                 // wider gaussian
                         float rel = abs(zi - z0) / max(z0, 1e-3);
                         float wD  = exp(-rel * 16.0);                             // silhouette guard
-                        float w = wS * wD;
+                        // Range guard on ALPHA, not on rgb luminance. Alpha carries the pure
+                        // beam baseline — no haze, no shadow — so everything worth preserving
+                        // (gobo shafts, cone rims) steps in alpha, while the shadow-jitter
+                        // grain this pass exists to remove lives ONLY in the rgb/alpha ratio
+                        // and leaves alpha flat. An rgb-luminance guard was tried first and
+                        // mistook that grain (also a many-fold step) for structure, which
+                        // un-denoised the volume shadows; keyed to alpha, shadow grain smooths
+                        // exactly as it did before the guard existed and shafts still hold.
+                        float dRel = abs((float)c.a - (float)c0.a) / (max((float)c0.a, (float)c.a) + 1e-4);
+                        float wR  = exp(-dRel * dRel * 6.0);
+                        float w = wS * wD * wR;
                         sum  += c * w;
                         wSum += w;
                     }
                 }
-                return wSum > 1e-4 ? sum / wSum : SAMPLE_TEXTURE2D_X_LOD(_BlitTexture, sampler_LinearClamp, uv, 0);
+                return wSum > 1e-4 ? sum / wSum : c0;
             }
             ENDHLSL
         }
