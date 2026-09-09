@@ -62,18 +62,37 @@ Axis** field to **Positive Z** if you'd rather aim it like a Unity spotlight, do
 | Beam Angle | Full beam (hotspot) cone angle in degrees — the brighter core; clamped to ≤ Spot Angle. |
 | Start Radius | Lens radius in metres — the beam's width at the source. |
 | Edge Softness | Softness of the beam's outer edge. |
-| Density | Overall volume density (raymarch accumulation strength). |
-| Anisotropy | Henyey-Greenstein scattering anisotropy *g*. 0 = uniform brightness from every viewing angle (legacy look). 0.5–0.7 = forward scattering: beams pointing at the camera flare up, the way real haze reads under stage lighting. Negative = back scattering. |
-| Axial Falloff | How strongly the beam fades along its length; 0 = no fade, 2 = fades fast. |
-| Hotspot | Strength of the bright core inside the beam-angle cone. |
-| Root Boost | Extra brightness near the lens (source flare/glare); 0 = off. |
-| Root Boost Frac | Length of the root glare, as a fraction of Range. |
-| Root White | How much the root glare desaturates toward white vs. tints with Color. |
-| Raymarch Steps | Sample count per pixel. Higher = smoother gradients, more GPU cost. |
-| Depth Occlude | Clip the beam against scene depth so it stops at walls/floors. |
+| **Look** | How the beam *reads*, as one block (`StageBeamLook`). A rig-driven source uses the same struct, so both paths share one definition. Fields below. |
+| Look ▸ Density | Overall volume density: raymarch accumulation strength, and how much haze the beam puts in front of the background (see Haze Extinction). |
+| Look ▸ Anisotropy | Henyey-Greenstein scattering anisotropy *g* (default 0.6). 0 = uniform brightness from every viewing angle. 0.5–0.7 = forward scattering: beams pointing at the camera flare up, the way real haze reads under stage lighting. Negative = back scattering. Exposure-neutral: a beam seen side-on keeps its brightness at any *g* and only the head-on flare changes, so it is safe to vary per fixture. |
+| Look ▸ Axial Falloff | How steeply the beam dims along its throw. 0 = even along its length; with the Physical Beam Model on, 2 = true inverse-square from the lens. The fade length follows the beam's own zoom (narrow beams carry far, wide washes die near the fixture) and the source end never changes. |
+| Look ▸ Hotspot | How tightly light bunches into the core. 0 = flat across the whole field. 1 = the fixture's own photometrics: half brightness at Beam Angle, a tenth at Spot Angle. Above 1 = a harder core than the real optics give. |
+| Look ▸ Root Glare | Extra white-hot glare right at the lens; 0 = off. Reach (0.1 × Range) and white bias (0.6) are fixed. |
+| Look ▸ Raymarch Steps | Sample count per pixel (default 48). Higher = smoother gradients and crisper gobo shafts, more GPU cost. Brightness does not change with the count. |
+| Look ▸ Depth Occlude | Clip the beam against scene depth so it stops at walls/floors. |
 | Gobo | Optional texture projected through the beam. None = plain cone. |
 | Gobo Rotation Deg | Static rotation offset of the gobo. |
 | Gobo Rotation Speed Deg Per Sec | Continuous gobo spin; 0 = static. |
+
+## Renderer feature: look settings
+
+These live on the Stage Beam Renderer Feature because they describe the *room* or the *renderer*,
+not a fixture. Per-fixture character stays in each light's Look.
+
+| Setting | What it does |
+|---|---|
+| Master Intensity | One dial for "beams vs scene" (default 0.08; see the Performance guide). |
+| Physical Beam Model | 0–1 (default 1). At 1 each beam gets a candela bell across its section from its own Beam/Spot angles, brightness decaying down the throw from an unchanged source end, and an edge that diffuses with distance. 0 = the legacy flat-topped look. Redistributes light rather than adding it, so rebalance with Master Intensity. |
+| Haze Extinction | How much the haze dims light passing through it, per metre (default 0.05, range 0–1). 0 = beams are pure additive glow. Above 0 a beam gains a visible near and far side **and darkens the background it crosses**, which is what lets an edge read against a bright set. Scales with each fixture's Density and follows the beam's shape (rim, throw, gobo), never its Intensity or the viewing angle. Above 0 beams always render through the offscreen buffer. |
+| Multi Scatter | How much of the haze glow has bounced more than once (default 0). 0.1–0.25 gives thick haze the soft halo it carries around a beam and stops beams pointed away from the camera going flat. Raise it together with fixture Density. |
+| Near Fade | Metres over which a beam eases back in just in front of the camera (default 0.35), so flying into a beam meets fog instead of a hard bright wall. 0 = off. |
+| Edge Anti-Alias | Softens the beam rim to at least this many pixels (default 1.5) so narrow or distant beams stop showing a staircase. Only ever widens; 0 = off. |
+
+**Beam edges against a bright background**: raise Haze Extinction before touching Edge Softness or
+the Resolution Factor. The darkening survives the reduced-resolution upsample, where a brighter rim
+would not. If beams then read as hard dark silhouettes rather than soft light, the *added* light is
+low relative to the occlusion: raise Master Intensity (or the fixture's Intensity) before lowering
+Extinction.
 
 ## Haze noise
 
@@ -160,8 +179,8 @@ spatial denoise) — temporal kills the frame-to-frame chatter, spatial kills th
 
 **Beams overpowering performers/characters**: the feature's **Master Intensity** slider
 scales every beam's volumetric brightness (and the projected pools) with one dial — the
-default is deliberately low (0.05) so characters inside beams stay readable; raise it for a
-heavier haze look. Note: a feature added before this default existed keeps its serialized
+default is deliberately low (0.08) so characters inside beams stay readable; raise it for a
+heavier haze look. Note: a feature asset saved under an earlier default keeps its serialized
 value — adjust the slider on the asset.
 
 **Keeping projected pools off performers**: the feature's **Projection Receiver Layers**
@@ -191,16 +210,15 @@ The two things that drive cost are **overlap** (how many beams stack on a pixel)
 coverage** (how many pixels each beam paints) — cost ≈ covered pixels × overlap × steps. The
 levers below attack those.
 
-- **Resolution Scale** (Renderer Feature, **default Quarter**): **Full / Half / Third / Quarter** —
-  raymarch pixel counts of 1/1, 1/4, **1/9** and 1/16 — composited with a depth-aware (joint
-  bilateral) upsample so object silhouettes stay clean instead of stair-stepping. This is the
-  **biggest fill-rate lever when beams cover the screen**, and the core look/perf tradeoff: lower =
-  far cheaper, higher = crisper beam edges. Quarter is the default as a good balance.
-  **Third** exists for the middle ground: the depth-aware upsample only rescues *object*
-  silhouettes (depth discontinuities) — a beam's own soft edge has no depth step, so it is simply
-  magnified, and gets visibly coarse as resolution drops. At high output resolutions Quarter can
-  read as too coarse while Half costs 4× more pixels; Third splits that. (The old *Half Resolution*
-  checkbox migrates to this enum automatically.)
+- **Resolution Factor** (Renderer Feature, **default 0.5**): beam buffer size as a fraction of
+  the screen per axis, 0.25–1. Cost scales with the square — 0.75 raymarches 56% of the pixels,
+  0.5 = 25%, 0.33 = 11% — composited with a depth-aware (joint bilateral) upsample so object
+  silhouettes stay clean instead of stair-stepping. This is the **biggest fill-rate lever when
+  beams cover the screen**, and the core look/perf tradeoff: lower = far cheaper, higher = crisper
+  beam edges and gobo/prism shafts. The depth-aware upsample only rescues *object* silhouettes
+  (depth discontinuities) — a beam's own soft edge has no depth step, so it is simply magnified,
+  and gets visibly coarse as the factor drops. Try raising Raymarch Steps before going below 0.5.
+  (The old *Resolution Scale* presets migrate to the slider automatically.)
 - **Dither** (Renderer Feature, **default 0.15**): anti-banding applied where the beam is
   composited into the camera target. Beams are wide, smooth, low-slope ramps — exactly the signal
   that shows Mach banding once written to the camera's low-mantissa HDR format (B10G11R11, i.e.
@@ -214,7 +232,7 @@ levers below attack those.
   dither instead (raise Raymarch Steps to hide any faint grain).
 - **Noise Smoothing** (on by default): a depth-aware 5×5 pass over the beam buffer before
   compositing. It averages away the raymarch/shadow jitter grain — most visible in shadowed
-  regions at Half/Quarter resolution (back-lit looks especially) — for a slightly softer fog.
+  regions at a low Resolution Factor (back-lit looks especially) — for a slightly softer fog.
   Near-free; leave it on unless you want the raw grain. (Under TAA this matters less; without
   TAA it's the main grain reducer.)
 - **Culling** (Renderer Feature ▸ Culling): **Frustum Cull** (on by default) drops beams whose
@@ -222,10 +240,12 @@ levers below attack those.
   (0 = off) additionally drops beams whose on-screen footprint is smaller than N pixels
   (distant/tiny beams whose contribution isn't visible). Both target the coverage side directly.
 - **Raymarch Steps** is the single biggest PER-BEAM cost lever — a linear multiplier on raymarch
-  work per covered pixel. Rig-driven sources typically default to 10 and it's usually indistinguishable from
-  24; lower still for background beams. Zoom-wide beams auto-reduce steps further (Adaptive
-  Steps on the driver). Inside the march, the shadow and haze terms are both re-sampled only
-  every other step (they vary slowly along the ray) — so their 3D-texture taps are already halved.
+  work per covered pixel. The Look default is 48; plain (gobo-less) beams are usually
+  indistinguishable at 16–24, and background beams can go lower still. The count does not change
+  brightness (each step is integrated analytically), so it can be tuned purely for cost.
+  Zoom-wide beams auto-reduce steps further (Adaptive Steps on the driver). Inside the march, the
+  shadow and haze terms are both re-sampled only every other step (they vary slowly along the
+  ray) — so their 3D-texture taps are already halved.
 - **Volume ▸ Volume Update Interval** (Volume shadows): rebuild the shadow volume every N frames
   instead of every frame. 2 halves the occlusion-build GPU cost (mesh voxelization + compute);
   the shadow is up to N-1 frames stale, which the Temporal smoothing absorbs for moving dancers.
@@ -244,8 +264,9 @@ levers below attack those.
 - Other feature-level costs to be aware of: **Haze Noise** (3D texture sample per raymarch
   sample when enabled) and **Project Onto Surfaces** (an extra full-screen decal pass) are both
   off by default and only cost what you opt into.
-- **Anisotropy** adds one normalize + pow per raymarch sample when non-zero; at 0 it compiles to
-  the untouched fast path.
+- **Anisotropy** adds one normalize plus a mul/sqrt/rcp per raymarch sample when non-zero (no
+  pow inside the loop); at 0 it compiles to the untouched fast path. Multi Scatter is one lerp on
+  top of that.
 
 ### Scaling note (hundreds of fully dynamic beams)
 

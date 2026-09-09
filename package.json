@@ -1,6 +1,6 @@
 {
   "name": "com.origuma.stage-beam",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "displayName": "Origuma Stage Beam",
   "description": "Standalone volumetric stage-light beams for URP. A ScriptableRendererFeature raymarches additive light cones with smooth edges, scene-depth occlusion, gobo projection and optional half-resolution rendering. No external dependencies beyond URP; push beams from any system via StageBeamQueue.",
   "unity": "6000.0",

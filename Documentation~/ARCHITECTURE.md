@@ -42,9 +42,9 @@
 
 | パス | 条件 | 内容 |
 |---|---|---|
-| Stage Beams | 加算モード & フル解像度 | activeColor へ直接、各ビームを DrawMesh(加算) |
-| Stage Beams (offscreen) | half-res **または** Soft Additive | オフスクリーン RT へレイマーチ |
-| Stage Beams (composite) | 〃 | `StageBeamUpsample.shader` で深度考慮アップサンプル+**天井カーブ**合成 |
+| Stage Beams | 加算モード & フル解像度 & Extinction = 0 | activeColor へ直接、各ビームを DrawMesh(加算) |
+| Stage Beams (offscreen) | Resolution Factor < 1 **または** Soft Additive **または** Extinction > 0 | オフスクリーン RT へレイマーチ。Extinction > 0 では第2ターゲット(RHalf)へ光学的深さ τ も MRT 出力(`_STAGEBEAM_TRANSMITTANCE`) |
+| Stage Beams (composite) | 〃 | `StageBeamUpsample.shader` で深度考慮アップサンプル+**天井カーブ**合成。`Blend One SrcAlpha` で alpha = exp(−τ) を背景に掛ける(τ 無しでは alpha = 1 で純加算と同一) |
 | Stage Beam Projection | `_projectOntoSurfaces` | 同じコーンを `StageBeamProjection.shader` (Cull Front) で描きゴボ×色を表面へデカール投影 |
 | Stage Beam Decal Composite | 投影 & Soft Additive | デカール専用 RT の合計へ天井カーブを掛けて合成 |
 
@@ -58,9 +58,11 @@
 `_BeamRTParams` (逆ターゲットサイズ) をパスごとに設定し、シーン深度サンプリングの
 UV がフル/半解像度どちらでも正しくなるようにしている。
 
-**Soft Additive はフル解像度でもオフスクリーン経由になる** — 天井カーブは「重なった
-ビームの合計値」を見る必要があり、これはパスごとの Blend 係数では表現できないため
-(§ [PERFORMANCE.md](PERFORMANCE.md))。
+**Soft Additive と透過(Haze Extinction > 0)はフル解像度でもオフスクリーン経由になる** —
+天井カーブは「重なったビームの合計値」を見る必要があり、これはパスごとの Blend 係数では
+表現できないため(§ [PERFORMANCE.md](PERFORMANCE.md))。透過も同じ理由で、ビーム間の透過率は
+乗算(T = T₁·T₂)だが加算ブレンドで積めるのは光学的深さ τ(T = exp(−Στ))なので、τ を
+第2ターゲットへ加算蓄積し、合成パスの alpha で一括して掛ける。
 
 ## 3. コーンシェーダ (`Origuma/StageBeamCone`)
 
@@ -87,6 +89,24 @@ UV がフル/半解像度どちらでも正しくなるようにしている。
   飛距離に比例して増加(ヘイズ拡散)。HG 位相の方向は仮想アペックス基準(レンズ原点だと
   根本で normalize が退化しちらつく)。カメラ直前は `_StageBeamNearFade` メートルかけて
   フェードイン。
+- **断面ベルの深さ = Hotspot**: `exp(−ln10·Hotspot·r^n)` と指数の中に入れる。0 でフラット、
+  1 で実仕様どおり(ビーム角 50%・フィールド角 10%)、2 でフィールド角 1%。高さ倍率
+  `(1+Hotspot)·bell` だと形を変えない単なるゲインだった。
+- **位相関数の正規化**: HG を**横向き(cosθ=0)で 1** になるよう割る(`(1+g²)^1.5 / d^1.5`)。
+  未正規化だと g=0.6 で横向きが 0.40 になり、フィクスチャ毎の Anisotropy が露出も動かして
+  しまう(Master はグローバルなので直せない)。`_StageBeamMultiScatter` で等方(=1.0)へ lerp
+  し、多重散乱の暈を近似。
+- **先端フェード**: 軸方向のカットは Range の最後 12% でフェード(以前は `step` で減衰の
+  残量ごと落としており、空中で終わるビームに平らな円盤が出ていた)。
+- **区間解析積分**: 各ステップの寄与は `(1−exp(−σΔ))/σ`(σ→0 で Δ に一致)。リーマン和だと、
+  減衰がステップ内で効く濃さでステップ数依存の露出になる。
+- **透過(`_StageBeamExtinction` > 0)**: 同じ σ から `trans`(ビュー側 Beer-Lambert)と光学的
+  深さ τ(第2 MRT ターゲット)を作る。σ = `Extinction·Density·hazeF·shape`、
+  `shape = inAxis·side·axialAtt·gobo` — **形だけ**で Intensity/Master/位相は入れない(明るさ
+  や視線角で遮蔽量が変わらないように)。inAxis だけだと、減衰しきった先端やリム外側まで
+  バウンド全域が全強度で遮蔽して「明るい芯の入った黒い円錐」になる。このモデルは霧を
+  ビーム内にしか置かないので、一様な不透明コーンは「霧の濃い場所」ではなく「澄んだ空気に
+  空いた穴」に見える。
 - **Root glare (`RootGlare`)**: レンズ近傍の指数ブースト。根本のグレアはこのダイヤルだけが
   作る(軸減衰はレンズ端を動かさない)。超過分を白成分/色成分に分離して別々に積分
   (強い光源コアの白飽和を再現)。届く距離 0.1×Range・白バイアス 0.6 は固定で、
@@ -97,8 +117,10 @@ UV がフル/半解像度どちらでも正しくなるようにしている。
   流速をスクリーン射影したもの)させ、ノイズがヘイズと一緒に流れて「画面に固定された
   汚れ」に見えにくくしている。低ステップ・低解像度時のグレインを TAA なしでも和らげる
   狙い(TAA があれば時間積分でさらに整うが、要否は好み・他の AA 次第)。
-- **ブレンド**: `_BeamSrcBlend/_BeamDstBlend` で Additive (One One) と
-  Soft Additive (OneMinusDstColor One) を切替(`StageBeamDriver.Blend`)。
+- **ブレンド**: 蓄積は両モードとも One One(`_BeamSrcBlend/_BeamDstBlend`。Soft Additive の
+  飽和はビーム単位では表現できないので合成側で行う)。合成パスは `Blend One SrcAlpha` +
+  `ColorMask RGB` — alpha は透過率 exp(−τ) をブレンド係数として使うだけで、カメラの alpha
+  には書かない。
 - **ゴボ**: `Texture2DArray` ×2系統(回転・スライス独立、1系統目は UV スクロール=
   アニメーションホイール対応)。単発 Texture2D は `StageBeamLight` 側で
   `Graphics.CopyTexture` により1スライス配列へラップされる(結果はキャッシュ、
@@ -233,7 +255,7 @@ MPB に注入。**ライトが解決できないビームは自動的に Volume 
 |---|---|
 | 共有占有ボリューム | シャドウコストがビーム本数に非依存(大量灯体の核心) |
 | ビーム境界球カリング | 視錐台外・画面投影半径 `_minScreenRadiusPx` 未満のビームをキュー段階で棄却 |
-| 解像度スケール(Full/Half/Third/Quarter) | レイマーチ RT の解像度を落とす(ピクセル 1/1・1/4・1/9・1/16)。深度考慮アップサンプルで縁を保護。詳細は PERFORMANCE §3.7 |
+| 解像度係数(0.25–1) | レイマーチ RT を軸あたりの係数で縮小(ピクセル数は二乗: 0.5 = 1/4、0.33 = 1/9)。深度考慮アップサンプルで縁を保護。詳細は PERFORMANCE §3.7 |
 | ゴボのプリフィルタ | ミップのフットプリントに**レイ方向のステップ間隔**を含める。自動ミップは画面方向しか見ないため、細いシャフトがステップ間で素通りしてモアレ化する。**負荷も同時に下がる**。PERFORMANCE §3.8 |
 | バンディング対策 | ディザは**精度が失われる場所**=合成の出口(カメラの B10G11R11)に置く。蓄積は ARGBHalf なのでそこでは不要。PERFORMANCE §3.9 |
 | `VolumeUpdateInterval` | 占有ボリュームを N フレームおきに再構築。構築コスト 1/N |

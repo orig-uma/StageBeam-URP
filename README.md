@@ -18,7 +18,9 @@ Renderer Feature を1つ足して `Stage Beam Light` を置くだけで動きま
 
 * **解析的レイマーチのコーンビーム:** 単位コーンを解析交差＋N ステップ積分で描画。Field/Beam 角、
   Hotspot、軸方向減衰、Root Glare（光源フレア）、Henyey-Greenstein 異方性散乱（カメラを向いた
-  ビームがフレア）。
+  ビームがフレア。横向きの明るさは g によらず一定）、多重散乱の暈。
+* **背景を減光する透過合成:** ヘイズの光学的深さを第2ターゲットに加算蓄積し、合成時に
+  `exp(−τ)` を背景に掛ける。純加算では埋もれる明るいセットの前でもビームの輪郭が読める。
 * **灯数非依存の共有ボリューム影:** 全ビームが参照する世界空間の占有ボリュームを1つだけ構築するので、
   **影のコストが灯体数に依存しません**。遮蔽物の実メッシュをボクセル化（スキン姿勢・布変形込みの実
   シルエット）し、充填→平滑化→時間 EMA でチラつきのない影に。3 バックエンド（ScreenSpace / Volume /
@@ -26,7 +28,7 @@ Renderer Feature を1つ足して `Stage Beam Light` を置くだけで動きま
 * **Soft Additive（白飛び対策）:** オフスクリーンに合計を蓄積して天井カーブに通すので、多灯が重なっても
   白飛び・ブルーム潰れ・ACES 変色が起きません。変調保存により飽和域でも影の削れ・ヘイズの流れが残ります。
   （→ [PERFORMANCE](Documentation~/PERFORMANCE.md)）
-* **運用向けの負荷レバー:** 解像度スケール（Full/Half/Third/Quarter・深度考慮アップサンプル）、境界球
+* **運用向けの負荷レバー:** 解像度係数（0.25–1・深度考慮アップサンプル）、境界球
   カリング、シャドウ/ヘイズ間引き、ズーム適応ステップ、占有ビルドの更新間隔、静的/動的オクルーダー分離、
   任意の GPU インスタンシング。フィルレート律速なので、負荷は灯数よりも**画面被覆とビューポート解像度**で
   決まります。
@@ -48,7 +50,7 @@ https://github.com/orig-uma/StageBeam-URP.git
 特定バージョンを指定する場合:
 
 ```
-https://github.com/orig-uma/StageBeam-URP.git#v0.1.0
+https://github.com/orig-uma/StageBeam-URP.git#v0.2.0
 ```
 
 ### Embedded
@@ -66,13 +68,14 @@ https://github.com/orig-uma/StageBeam-URP.git#v0.1.0
 | 項目 | 内容 |
 | :--- | :--- |
 | Cone Beam | 単位コーンを解析交差＋レイマーチ。Field/Beam 角、Hotspot、Axial Falloff、Root Glare（光源フレア） |
-| Scattering | Henyey-Greenstein 異方性散乱（g）。カメラを向いたビームがステージヘイズのようにフレアする |
+| Scattering | Henyey-Greenstein 異方性散乱（g）。カメラを向いたビームがステージヘイズのようにフレアする。横向きで 1 に正規化（露出中立）、Multi Scatter で多重散乱の暈 |
+| Transmittance | Haze Extinction > 0 でビームが背景を減光。光学的深さ τ を MRT 第2ターゲットに加算蓄積し、合成で `Blend One SrcAlpha`。遮蔽量はビームの形（リム・飛距離・ゴボ）と Density に従い、Intensity や視線角には依存しない |
 | Depth Occlusion | シーン深度でビームをクリップ。遮蔽面手前は Contact Fade で減衰（硬い明円盤を防ぐ） |
 | Volumetric Shadows | 3 バックエンド（ScreenSpace / Volume / LightShadowMap）。**灯数非依存の共有占有ボリューム**。メッシュボクセル化（スキン/布込み実シルエット）＋充填→blur→時間 EMA。ゼロセットアップ（Renderer Feature のドロップダウン1つ） |
 | Static/Dynamic Split | 動かない剛体オクルーダーをキャッシュ、動くもの（スキン/移動）だけ毎ビルド再構築。自動判定（レイヤー不要）。ゆるいマスクでもビルドスパイクを抑制。opt-in |
 | Soft Additive | オフスクリーン蓄積＋天井カーブで多灯重なりの白飛び/ブルーム潰れ/ACES 変色を防止。変調保存で影・ヘイズを維持。床プールも同処理 |
 | Gobo | 最大 2 枚のゴボ投影（Texture2DArray、回転・アニメホイールスクロール独立） |
-| Resolution Scale | Full / Half / Third / Quarter（ピクセル 1/1・1/4・1/9・1/16）。深度考慮（joint bilateral）アップサンプル。フィルレート最大の負荷レバー |
+| Resolution Factor | 0.25–1（ピクセル数は二乗で効く: 0.5 = 1/4、0.33 = 1/9）。深度考慮（joint bilateral）アップサンプル。フィルレート最大の負荷レバー |
 | Anti-banding | 合成時（カメラの低仮数 HDR 形式に書く瞬間）の値相対ディザ。ビームの緩いランプが拾うマッハバンドを除去 |
 | Haze Noise | 3D ノイズによるヘイズの揺らぎ（同梱・自動ロード）。流速一致ジッターで低解像度のグレインを緩和 |
 | Surface Projection | 床のライトプール（ゴボ×色をデカール投影）。Receiver Layer マスク、Shadow Hardness で遮蔽感を調整 |
